@@ -48,7 +48,7 @@ v5 已知问题：板面未留外部供电入口，只能依赖 ST-Link 的 3.3 
 - **灌注指数 PI**：AC/DC 比，反映末梢灌注强弱
 - **跌倒检测**：MPU6050 三阶段判据——冲击 ≥ 2.2 g → 220 ms 内静止 0.65~1.35 g → 重力方向与竖直夹角 ≥ 63°，满足后蜂鸣器报警，10 s 自动复位
 - **OLED 三页轮播**：3 s 自动翻页；手指在位时锁定在测量页，拿开后恢复轮播
-- **三端显示**：PyQt5 电脑上位机、Flask + SSE 手机网页、原生 Android APK
+- **三端显示**：PyQt5 电脑上位机、标准库 HTTP + SSE 手机网页、原生 Android APK
 
 ## 实测指标
 
@@ -70,9 +70,11 @@ v5 已知问题：板面未留外部供电入口，只能依赖 ST-Link 的 3.3 
 
 ```
 01_报告/              课设报告（定稿 + 两份过程稿，保留算法演进轨迹）
-02_固件/              main.c（裸机寄存器级）、LED_Blink.hex、烧录与调试文档
+02_固件/              main.c（裸机寄存器级，11-16 定型版）、LED_Blink.hex、烧录与调试文档
+  CubeIDE工程/        STM32CubeIDE 完整工程（内含 11-18 调试版源码，已验证可编译）
+  演进快照/           8 个开发过程的 .bak 备份
   历史固件/           三版里程碑 hex
-03_上位机/            ppg_monitor.py（PyQt5 串口版）、web_monitor.py（Flask 手机网页版）
+03_上位机/            ppg_monitor.py（PyQt5 串口版）、web_monitor.py（零依赖 HTTP + SSE 网页版）
 04_验收数据/          采集 CSV、原始 400 点窗、可复跑的采集脚本
 05_设计资料/          PCB 工程（立创 EDA 源文件）、原理图与布线图、转接板交接文档、旧板验证报告
    PCB工程/            v5 回退版工程 zip + 原理图 + PCB 布线图
@@ -83,23 +85,29 @@ v5 已知问题：板面未留外部供电入口，只能依赖 ST-Link 的 3.3 
 
 ## 快速开始
 
-### 编译与烧录
+### 编译
 
-固件用 STM32CubeIDE 的 GNU 工具链构建（裸机，非 HAL）：
+固件是裸机寄存器级实现（非 HAL），完整工程在 `02_固件/CubeIDE工程/`：
+
+1. STM32CubeIDE：`File → Import → General → Existing Projects into Workspace`，选中该目录
+2. `Project → Build`，产物在 `Debug/LED_Blink.elf` 与 `.hex`
+
+已用 CubeIDE 自带的 arm-none-eabi-gcc 14.2.1 做过全量重建验证：`text 28,980 B / data 104 B / bss 12,528 B`，无 error。有若干 unused-function 警告，属调试残留，不影响运行。
+
+> 注意：工程里是 11-18 调试版源码；`02_固件/main.c` 是 11-16 定型版，两者不同，详见 `02_固件/README.md`。
+
+### 烧录
 
 ```bash
-arm-none-eabi-objcopy -O ihex LED_Blink.elf LED_Blink.hex
-
-STM32_Programmer_CLI.exe -c port=SWD freq=1000 \
-  -w LED_Blink.hex -v -rst -run
+STM32_Programmer_CLI.exe -c port=SWD freq=1000 -w LED_Blink.hex -v -rst -run
 ```
 
-看到 `Download verified successfully` 即成功。详细参数见 `02_固件/STM32板子烧录与调试配置文档.md`。
+看到 `Download verified successfully` 即成功。也可以直接用 `02_固件/LED_Blink.hex`，无需自行编译。详细参数见 `02_固件/STM32板子烧录与调试配置文档.md`。
 
 ### 电脑上位机
 
 ```bash
-pip install pyserial pyqt5
+pip install -r requirements.txt
 python 03_上位机/ppg_monitor.py
 ```
 
@@ -158,7 +166,7 @@ MIT License，见 [LICENSE](LICENSE)。报告与数据同样可自由引用，�
 |---|---|
 | 固件实现与调试 | 寄存器级外设初始化、脉率/血氧计算逻辑、烧录排错 |
 | 算法迭代 | 五轮判据的设计讨论、实测数据的统计与归因 |
-| 上位机 | PyQt5 串口端、Flask + SSE 网页端、Android App 的功能实现与 UI |
+| 上位机 | PyQt5 串口端、标准库 HTTP + SSE 网页端、Android App 的功能实现与 UI |
 | 文档 | 课设报告结构、README、交接文档的撰写与整理 |
 
 原理图与 PCB 布线的设计决策、器件选型、实验方案与数据采集由作者本人完成。

@@ -1,0 +1,6 @@
+# 上位机依赖
+# ppg_monitor.py 需要全部三项；web_monitor.py 只需要 pyserial
+
+pyserial>=3.5
+PyQt5>=5.15.0
+pyqtgraph>=0.13.0

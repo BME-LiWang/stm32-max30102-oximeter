@@ -1,0 +1,1171 @@
+/*
+ * PPG_STM32 转接板 v5 —— 血氧 + 跌倒监测 初版固件
+ * STM32F103C8T6 @ 8MHz HSI
+ *
+ * I2C1 (PB6/PB7)  : OLED SH1106 0x3C, MPU6050 0x68
+ * I2C2 (PB10/PB11): MAX30102 0x57
+ * USART2 (PA2/PA3): JDY-31 9600
+ * BEEP PB13, LED PC13, KEY1-4 = PB1/PA6/PA8/PB15
+ */
+
+#include <stdint.h>
+
+/* ==================== 寄存器 ==================== */
+#define RCC_APB1ENR   (*(volatile uint32_t *)0x4002101CU)
+#define RCC_APB2ENR   (*(volatile uint32_t *)0x40021018U)
+
+#define GPIOA_CRL     (*(volatile uint32_t *)0x40010800U)
+#define GPIOA_CRH     (*(volatile uint32_t *)0x40010804U)
+#define GPIOA_IDR     (*(volatile uint32_t *)0x40010808U)
+#define GPIOA_ODR     (*(volatile uint32_t *)0x4001080CU)
+
+#define GPIOB_CRL     (*(volatile uint32_t *)0x40010C00U)
+#define GPIOB_CRH     (*(volatile uint32_t *)0x40010C04U)
+#define GPIOB_IDR     (*(volatile uint32_t *)0x40010C08U)
+#define GPIOB_ODR     (*(volatile uint32_t *)0x40010C0CU)
+
+#define GPIOC_CRH     (*(volatile uint32_t *)0x40011004U)
+#define GPIOC_ODR     (*(volatile uint32_t *)0x4001100CU)
+
+#define I2C1_CR1      (*(volatile uint32_t *)0x40005400U)
+#define I2C1_CR2      (*(volatile uint32_t *)0x40005404U)
+#define I2C1_DR       (*(volatile uint32_t *)0x40005410U)
+#define I2C1_SR1      (*(volatile uint32_t *)0x40005414U)
+#define I2C1_SR2      (*(volatile uint32_t *)0x40005418U)
+#define I2C1_CCR      (*(volatile uint32_t *)0x4000541CU)
+#define I2C1_TRISE    (*(volatile uint32_t *)0x40005420U)
+
+#define I2C2_CR1      (*(volatile uint32_t *)0x40005800U)
+#define I2C2_CR2      (*(volatile uint32_t *)0x40005804U)
+#define I2C2_DR       (*(volatile uint32_t *)0x40005810U)
+#define I2C2_SR1      (*(volatile uint32_t *)0x40005814U)
+#define I2C2_SR2      (*(volatile uint32_t *)0x40005818U)
+#define I2C2_CCR      (*(volatile uint32_t *)0x4000581CU)
+#define I2C2_TRISE    (*(volatile uint32_t *)0x40005820U)
+
+#define USART2_SR     (*(volatile uint32_t *)0x40004400U)
+#define USART2_DR     (*(volatile uint32_t *)0x40004404U)
+#define USART2_BRR    (*(volatile uint32_t *)0x40004408U)
+#define USART2_CR1    (*(volatile uint32_t *)0x4000440CU)
+
+#define SYSTICK_CTRL  (*(volatile uint32_t *)0xE000E010U)
+#define SYSTICK_LOAD  (*(volatile uint32_t *)0xE000E014U)
+#define SYSTICK_VAL   (*(volatile uint32_t *)0xE000E018U)
+
+#define LED_ON()      (GPIOC_ODR &= ~(1U << 13))
+#define LED_OFF()     (GPIOC_ODR |=  (1U << 13))
+#define BEEP_ON()     (GPIOB_ODR |=  (1U << 13))
+#define BEEP_OFF()    (GPIOB_ODR &= ~(1U << 13))
+
+#define KEY1_DOWN()   ((GPIOB_IDR & (1U << 1))  == 0U)
+#define KEY2_DOWN()   ((GPIOA_IDR & (1U << 6))  == 0U)
+#define KEY3_DOWN()   ((GPIOA_IDR & (1U << 8))  == 0U)
+#define KEY4_DOWN()   ((GPIOB_IDR & (1U << 15)) == 0U)
+
+#define OLED_ADDR     0x78U
+#define MPU_ADDR      0xD0U
+#define MAX_ADDR      0xAEU
+
+/* ==================== I2C 总线 ==================== */
+typedef struct {
+    volatile uint32_t *CR1, *CR2, *DR, *SR1, *SR2, *CCR, *TRISE;
+    uint32_t apb1en;
+} i2c_bus_t;
+
+static i2c_bus_t bus1 = { &I2C1_CR1, &I2C1_CR2, &I2C1_DR, &I2C1_SR1, &I2C1_SR2, &I2C1_CCR, &I2C1_TRISE, (1U << 21) };
+static i2c_bus_t bus2 = { &I2C2_CR1, &I2C2_CR2, &I2C2_DR, &I2C2_SR1, &I2C2_SR2, &I2C2_CCR, &I2C2_TRISE, (1U << 22) };
+
+/* ==================== 延时 ==================== */
+static void delay_ms(uint32_t ms)
+{
+    SYSTICK_LOAD = 7999U;
+    SYSTICK_VAL  = 0U;
+    SYSTICK_CTRL = 0x00000005U;
+    while (ms--) {
+        while ((SYSTICK_CTRL & (1U << 16)) == 0U) { }
+    }
+    SYSTICK_CTRL = 0U;
+}
+
+/* ==================== GPIO ==================== */
+static void gpio_init(void)
+{
+    RCC_APB2ENR |= (1U << 0) | (1U << 2) | (1U << 3) | (1U << 4);
+
+    GPIOB_CRL &= ~(0xFFU << 24);  GPIOB_CRL |= (0xFFU << 24);   /* PB6/PB7 AF OD */
+    GPIOB_CRH &= ~(0xFFU << 8);   GPIOB_CRH |= (0xFFU << 8);    /* PB10/PB11 AF OD */
+
+    GPIOA_CRL &= ~(0xFU << 8);    GPIOA_CRL |= (0xBU << 8);     /* PA2 AF PP */
+    GPIOA_CRL &= ~(0xFU << 12);   GPIOA_CRL |= (0x4U << 12);    /* PA3 floating */
+
+    GPIOC_CRH &= ~(0xFU << 20);   GPIOC_CRH |= (0x2U << 20);    /* PC13 out */
+    LED_OFF();
+
+    GPIOB_CRH &= ~(0xFU << 20);   GPIOB_CRH |= (0x2U << 20);    /* PB13 out */
+    BEEP_OFF();
+
+    GPIOB_CRL &= ~(0xFU << 4);    GPIOB_CRL |= (0x8U << 4);  GPIOB_ODR |= (1U << 1);
+    GPIOA_CRL &= ~(0xFU << 24);   GPIOA_CRL |= (0x8U << 24); GPIOA_ODR |= (1U << 6);
+    GPIOA_CRH &= ~(0xFU << 0);    GPIOA_CRH |= (0x8U << 0);  GPIOA_ODR |= (1U << 8);
+    GPIOB_CRH &= ~(0xFU << 28);   GPIOB_CRH |= (0x8U << 28); GPIOB_ODR |= (1U << 15);
+}
+
+/* ==================== I2C ==================== */
+static void i2c_init(i2c_bus_t *b)
+{
+    RCC_APB1ENR |= b->apb1en;
+    *b->CR1 = 0U;
+    *b->CR2 = 8U;
+    *b->CCR = 40U;
+    *b->TRISE = 9U;
+    *b->CR1 = (1U << 0);
+}
+
+static uint8_t i2c_write(i2c_bus_t *b, uint8_t addr, const uint8_t *buf, uint16_t n)
+{
+    uint32_t guard;
+    uint16_t i;
+
+    *b->CR1 |= (1U << 8);
+    guard = 0U;
+    while ((*b->SR1 & (1U << 0)) == 0U) {
+        if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 1U; }
+    }
+    *b->DR = addr;
+    guard = 0U;
+    while ((*b->SR1 & (1U << 1)) == 0U) {
+        if (*b->SR1 & (1U << 10)) { *b->SR1 &= ~(1U << 10); *b->CR1 |= (1U << 9); return 2U; }
+        if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 2U; }
+    }
+    (void)*b->SR1; (void)*b->SR2;
+
+    for (i = 0U; i < n; i++) {
+        guard = 0U;
+        while ((*b->SR1 & (1U << 7)) == 0U) {
+            if (*b->SR1 & (1U << 10)) { *b->SR1 &= ~(1U << 10); *b->CR1 |= (1U << 9); return 3U; }
+            if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 3U; }
+        }
+        *b->DR = buf[i];
+    }
+    guard = 0U;
+    while ((*b->SR1 & (1U << 2)) == 0U) {
+        if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 3U; }
+    }
+    *b->CR1 |= (1U << 9);
+    guard = 0U;
+    while (*b->SR2 & (1U << 1)) { if (++guard > 100000U) break; }
+    return 0U;
+}
+
+static uint8_t i2c_read(i2c_bus_t *b, uint8_t addr, uint8_t reg, uint8_t *buf, uint16_t n)
+{
+    uint32_t guard;
+    uint16_t i;
+
+    if (n == 0U) return 4U;
+
+    *b->CR1 |= (1U << 8);
+    guard = 0U;
+    while ((*b->SR1 & (1U << 0)) == 0U) {
+        if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 1U; }
+    }
+    *b->DR = addr;
+    guard = 0U;
+    while ((*b->SR1 & (1U << 1)) == 0U) {
+        if (*b->SR1 & (1U << 10)) { *b->SR1 &= ~(1U << 10); *b->CR1 |= (1U << 9); return 2U; }
+        if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 2U; }
+    }
+    (void)*b->SR1; (void)*b->SR2;
+
+    guard = 0U;
+    while ((*b->SR1 & (1U << 7)) == 0U) { if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 3U; } }
+    *b->DR = reg;
+    guard = 0U;
+    while ((*b->SR1 & (1U << 7)) == 0U) { if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 3U; } }
+
+    *b->CR1 |= (1U << 8);
+    guard = 0U;
+    while ((*b->SR1 & (1U << 0)) == 0U) { if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 1U; } }
+
+    *b->DR = addr | 0x01U;
+    guard = 0U;
+    while ((*b->SR1 & (1U << 1)) == 0U) {
+        if (*b->SR1 & (1U << 10)) { *b->SR1 &= ~(1U << 10); *b->CR1 |= (1U << 9); return 2U; }
+        if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 2U; }
+    }
+    (void)*b->SR1; (void)*b->SR2;
+
+    if (n == 1U) *b->CR1 &= ~(1U << 10);
+    else         *b->CR1 |=  (1U << 10);
+
+    for (i = 0U; i < n; i++) {
+        if (i + 2U == n) *b->CR1 &= ~(1U << 10);
+        guard = 0U;
+        while ((*b->SR1 & (1U << 6)) == 0U) { if (++guard > 200000U) { *b->CR1 |= (1U << 9); return 3U; } }
+        if (i + 1U == n) *b->CR1 |= (1U << 9);
+        buf[i] = (uint8_t)*b->DR;
+    }
+    guard = 0U;
+    while (*b->SR2 & (1U << 1)) { if (++guard > 100000U) break; }
+    *b->CR1 |= (1U << 10);
+    return 0U;
+}
+
+static uint8_t i2c_wreg(i2c_bus_t *b, uint8_t addr, uint8_t reg, uint8_t val)
+{
+    uint8_t d[2];
+    d[0] = reg; d[1] = val;
+    return i2c_write(b, addr, d, 2U);
+}
+
+static uint8_t i2c_rreg(i2c_bus_t *b, uint8_t addr, uint8_t reg, uint8_t *val)
+{
+    return i2c_read(b, addr, reg, val, 1U);
+}
+
+static uint8_t i2c_ping(i2c_bus_t *b, uint8_t addr)
+{
+    uint8_t d = 0U;
+    return i2c_write(b, addr, &d, 1U);
+}
+
+/* ==================== OLED ==================== */
+static uint8_t oled_buf[8][128];
+static uint8_t oled_present;
+
+static uint8_t page_idx;
+static uint8_t measure_on = 1U;
+
+static const uint8_t oled_init_seq[] = {
+    0x00,
+    0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40,
+    0xA0, 0xC0, 0xDA, 0x12, 0x81, 0xCF, 0xD9, 0xF1,
+    0xDB, 0x30, 0xA4, 0xA6, 0x8D, 0x14, 0xAF
+};
+
+static const uint8_t F8x16[95][16] = {
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0xF8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x33,0x30,0x00,0x00,0x00,
+    0x00,0x16,0x0E,0x00,0x16,0x0E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x40,0xC0,0x78,0x40,0xC0,0x78,0x40,0x00,0x04,0x3F,0x04,0x04,0x3F,0x04,0x04,0x00,
+    0x00,0x70,0x88,0xFC,0x08,0x30,0x00,0x00,0x00,0x18,0x20,0xFF,0x21,0x1E,0x00,0x00,
+    0xF0,0x08,0xF0,0x00,0xE0,0x18,0x00,0x00,0x00,0x21,0x1C,0x03,0x1E,0x21,0x1E,0x00,
+    0x00,0xF0,0x08,0x88,0x70,0x00,0x00,0x00,0x1E,0x21,0x23,0x24,0x19,0x27,0x21,0x10,
+    0x00,0x00,0x00,0x16,0x0E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0xE0,0x18,0x04,0x02,0x00,0x00,0x00,0x00,0x07,0x18,0x20,0x40,0x00,
+    0x00,0x02,0x04,0x18,0xE0,0x00,0x00,0x00,0x00,0x40,0x20,0x18,0x07,0x00,0x00,0x00,
+    0x40,0x40,0x80,0xF0,0x80,0x40,0x40,0x00,0x02,0x02,0x01,0x0F,0x01,0x02,0x02,0x00,
+    0x00,0x00,0x00,0xF0,0x00,0x00,0x00,0x00,0x01,0x01,0x01,0x1F,0x01,0x01,0x01,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xB0,0x70,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x30,0x30,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x80,0x60,0x18,0x04,0x00,0x60,0x18,0x06,0x01,0x00,0x00,0x00,
+    0x00,0xE0,0x10,0x08,0x08,0x10,0xE0,0x00,0x00,0x0F,0x10,0x20,0x20,0x10,0x0F,0x00,
+    0x00,0x10,0x10,0xF8,0x00,0x00,0x00,0x00,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x00,0x70,0x08,0x08,0x08,0x88,0x70,0x00,0x00,0x30,0x28,0x24,0x22,0x21,0x30,0x00,
+    0x00,0x30,0x08,0x88,0x88,0x48,0x30,0x00,0x00,0x18,0x20,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0x00,0xC0,0x20,0x10,0xF8,0x00,0x00,0x00,0x07,0x04,0x24,0x24,0x3F,0x24,0x00,
+    0x00,0xF8,0x08,0x88,0x88,0x08,0x08,0x00,0x00,0x19,0x21,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0xE0,0x10,0x88,0x88,0x18,0x00,0x00,0x00,0x0F,0x11,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0x38,0x08,0x08,0xC8,0x38,0x08,0x00,0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00,
+    0x00,0x70,0x88,0x08,0x08,0x88,0x70,0x00,0x00,0x1C,0x22,0x21,0x21,0x22,0x1C,0x00,
+    0x00,0xE0,0x10,0x08,0x08,0x10,0xE0,0x00,0x00,0x00,0x31,0x22,0x22,0x11,0x0F,0x00,
+    0x00,0x00,0x00,0xC0,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x30,0x30,0x00,0x00,0x00,
+    0x00,0x00,0x00,0xC0,0xC0,0x00,0x00,0x00,0x00,0x00,0x80,0xB0,0x70,0x00,0x00,0x00,
+    0x00,0x00,0x80,0x40,0x20,0x10,0x08,0x00,0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x00,
+    0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x00,0x04,0x04,0x04,0x04,0x04,0x04,0x04,0x00,
+    0x00,0x08,0x10,0x20,0x40,0x80,0x00,0x00,0x00,0x20,0x10,0x08,0x04,0x02,0x01,0x00,
+    0x00,0x70,0x48,0x08,0x08,0x08,0xF0,0x00,0x00,0x00,0x00,0x30,0x36,0x01,0x00,0x00,
+    0xC0,0x30,0xC8,0x28,0xE8,0x10,0xE0,0x00,0x07,0x18,0x27,0x24,0x23,0x14,0x0B,0x00,
+    0x00,0x00,0xC0,0x38,0xE0,0x00,0x00,0x00,0x20,0x3C,0x23,0x02,0x02,0x27,0x38,0x20,
+    0x08,0xF8,0x88,0x88,0x88,0x70,0x00,0x00,0x20,0x3F,0x20,0x20,0x20,0x11,0x0E,0x00,
+    0xC0,0x30,0x08,0x08,0x08,0x08,0x38,0x00,0x07,0x18,0x20,0x20,0x20,0x10,0x08,0x00,
+    0x08,0xF8,0x08,0x08,0x08,0x10,0xE0,0x00,0x20,0x3F,0x20,0x20,0x20,0x10,0x0F,0x00,
+    0x08,0xF8,0x88,0x88,0xE8,0x08,0x10,0x00,0x20,0x3F,0x20,0x20,0x23,0x20,0x18,0x00,
+    0x08,0xF8,0x88,0x88,0xE8,0x08,0x10,0x00,0x20,0x3F,0x20,0x00,0x03,0x00,0x00,0x00,
+    0xC0,0x30,0x08,0x08,0x08,0x38,0x00,0x00,0x07,0x18,0x20,0x20,0x22,0x1E,0x02,0x00,
+    0x08,0xF8,0x08,0x00,0x00,0x08,0xF8,0x08,0x20,0x3F,0x21,0x01,0x01,0x21,0x3F,0x20,
+    0x00,0x08,0x08,0xF8,0x08,0x08,0x00,0x00,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x00,0x00,0x08,0x08,0xF8,0x08,0x08,0x00,0xC0,0x80,0x80,0x80,0x7F,0x00,0x00,0x00,
+    0x08,0xF8,0x88,0xC0,0x28,0x18,0x08,0x00,0x20,0x3F,0x20,0x01,0x26,0x38,0x20,0x00,
+    0x08,0xF8,0x08,0x00,0x00,0x00,0x00,0x00,0x20,0x3F,0x20,0x20,0x20,0x20,0x30,0x00,
+    0x08,0xF8,0xF8,0x00,0xF8,0xF8,0x08,0x00,0x20,0x3F,0x00,0x3F,0x00,0x3F,0x20,0x00,
+    0x08,0xF8,0x30,0xC0,0x00,0x08,0xF8,0x08,0x20,0x3F,0x20,0x00,0x07,0x18,0x3F,0x00,
+    0xE0,0x10,0x08,0x08,0x08,0x10,0xE0,0x00,0x0F,0x10,0x20,0x20,0x20,0x10,0x0F,0x00,
+    0x08,0xF8,0x08,0x08,0x08,0x08,0xF0,0x00,0x20,0x3F,0x21,0x01,0x01,0x01,0x00,0x00,
+    0xE0,0x10,0x08,0x08,0x08,0x10,0xE0,0x00,0x0F,0x18,0x24,0x24,0x38,0x50,0x4F,0x00,
+    0x08,0xF8,0x88,0x88,0x88,0x88,0x70,0x00,0x20,0x3F,0x20,0x00,0x03,0x0C,0x30,0x20,
+    0x00,0x70,0x88,0x08,0x08,0x08,0x38,0x00,0x00,0x38,0x20,0x21,0x21,0x22,0x1C,0x00,
+    0x18,0x08,0x08,0xF8,0x08,0x08,0x18,0x00,0x00,0x00,0x20,0x3F,0x20,0x00,0x00,0x00,
+    0x08,0xF8,0x08,0x00,0x00,0x08,0xF8,0x08,0x00,0x1F,0x20,0x20,0x20,0x20,0x1F,0x00,
+    0x08,0x78,0x88,0x00,0x00,0xC8,0x38,0x08,0x00,0x00,0x07,0x38,0x0E,0x01,0x00,0x00,
+    0xF8,0x08,0x00,0xF8,0x00,0x08,0xF8,0x00,0x03,0x3C,0x07,0x00,0x07,0x3C,0x03,0x00,
+    0x08,0x18,0x68,0x80,0x80,0x68,0x18,0x08,0x20,0x30,0x2C,0x03,0x03,0x2C,0x30,0x20,
+    0x08,0x38,0xC8,0x00,0xC8,0x38,0x08,0x00,0x00,0x00,0x20,0x3F,0x20,0x00,0x00,0x00,
+    0x10,0x08,0x08,0x08,0xC8,0x38,0x08,0x00,0x20,0x38,0x26,0x21,0x20,0x20,0x18,0x00,
+    0x00,0x00,0x00,0xFE,0x02,0x02,0x02,0x00,0x00,0x00,0x00,0x7F,0x40,0x40,0x40,0x00,
+    0x00,0x0C,0x30,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x06,0x38,0xC0,0x00,
+    0x00,0x02,0x02,0x02,0xFE,0x00,0x00,0x00,0x00,0x40,0x40,0x40,0x7F,0x00,0x00,0x00,
+    0x00,0x20,0x10,0x08,0x04,0x08,0x10,0x20,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
+    0x00,0x02,0x04,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x00,0x00,0x00,0x19,0x24,0x22,0x22,0x22,0x3F,0x20,
+    0x08,0xF8,0x00,0x80,0x80,0x00,0x00,0x00,0x00,0x3F,0x11,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0x00,0x00,0x80,0x80,0x80,0x00,0x00,0x00,0x0E,0x11,0x20,0x20,0x20,0x11,0x00,
+    0x00,0x00,0x00,0x80,0x80,0x88,0xF8,0x00,0x00,0x0E,0x11,0x20,0x20,0x10,0x3F,0x20,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x00,0x00,0x00,0x1F,0x22,0x22,0x22,0x22,0x13,0x00,
+    0x00,0x80,0x80,0xF0,0x88,0x88,0x88,0x18,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x80,0x00,0x00,0x6B,0x94,0x94,0x94,0x93,0x60,0x00,
+    0x08,0xF8,0x00,0x80,0x80,0x80,0x00,0x00,0x20,0x3F,0x21,0x00,0x00,0x20,0x3F,0x20,
+    0x00,0x80,0x98,0x98,0x00,0x00,0x00,0x00,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x00,0x00,0x00,0x80,0x98,0x98,0x00,0x00,0x00,0xC0,0x80,0x80,0x80,0x7F,0x00,0x00,
+    0x08,0xF8,0x00,0x00,0x80,0x80,0x80,0x00,0x20,0x3F,0x24,0x02,0x2D,0x30,0x20,0x00,
+    0x00,0x08,0x08,0xF8,0x00,0x00,0x00,0x00,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x00,0x20,0x3F,0x20,0x00,0x3F,0x20,0x00,0x3F,
+    0x00,0x80,0x80,0x00,0x80,0x80,0x00,0x00,0x00,0x20,0x3F,0x21,0x00,0x20,0x3F,0x20,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x00,0x00,0x00,0x1F,0x20,0x20,0x20,0x20,0x1F,0x00,
+    0x80,0x80,0x00,0x80,0x80,0x00,0x00,0x00,0x80,0xFF,0xA1,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0x00,0x00,0x80,0x80,0x80,0x80,0x00,0x00,0x0E,0x11,0x20,0x20,0xA0,0xFF,0x80,
+    0x80,0x80,0x80,0x00,0x80,0x80,0x80,0x00,0x20,0x20,0x3F,0x21,0x20,0x00,0x01,0x00,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x80,0x00,0x00,0x33,0x24,0x24,0x24,0x24,0x19,0x00,
+    0x00,0x80,0x80,0xE0,0x80,0x80,0x00,0x00,0x00,0x00,0x00,0x1F,0x20,0x20,0x00,0x00,
+    0x80,0x80,0x00,0x00,0x00,0x80,0x80,0x00,0x00,0x1F,0x20,0x20,0x20,0x10,0x3F,0x20,
+    0x80,0x80,0x80,0x00,0x00,0x80,0x80,0x80,0x00,0x01,0x0E,0x30,0x08,0x06,0x01,0x00,
+    0x80,0x80,0x00,0x80,0x00,0x80,0x80,0x80,0x0F,0x30,0x0C,0x03,0x0C,0x30,0x0F,0x00,
+    0x00,0x80,0x80,0x00,0x80,0x80,0x80,0x00,0x00,0x20,0x31,0x2E,0x0E,0x31,0x20,0x00,
+    0x80,0x80,0x80,0x00,0x00,0x80,0x80,0x80,0x80,0x81,0x8E,0x70,0x18,0x06,0x01,0x00,
+    0x00,0x80,0x80,0x80,0x80,0x80,0x80,0x00,0x00,0x21,0x30,0x2C,0x22,0x21,0x30,0x00,
+    0x00,0x00,0x00,0x00,0x80,0x7C,0x02,0x02,0x00,0x00,0x00,0x00,0x00,0x3F,0x40,0x40,
+    0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x00,
+    0x00,0x02,0x02,0x7C,0x80,0x00,0x00,0x00,0x00,0x40,0x40,0x3F,0x00,0x00,0x00,0x00,
+    0x00,0x80,0x40,0x40,0x80,0x00,0x00,0x80,0x00,0x00,0x00,0x00,0x00,0x01,0x01,0x00
+};
+
+static void oled_flush(void)
+{
+    uint8_t d[133];
+    uint8_t c[4];
+    uint8_t page, i;
+    if (!oled_present) return;
+
+    for (page = 0U; page < 8U; page++) {
+        c[0] = 0x00U;
+        c[1] = (uint8_t)(0xB0U | page);
+        c[2] = 0x02U;
+        c[3] = 0x10U;
+        if (i2c_write(&bus1, OLED_ADDR, c, 4U) != 0U) return;
+        d[0] = 0x40U;
+        for (i = 0U; i < 132U; i++)
+            d[1U + i] = (i < 128U) ? oled_buf[page][i] : 0x00U;
+        if (i2c_write(&bus1, OLED_ADDR, d, 133U) != 0U) return;
+    }
+}
+
+static void oled_clear(void)
+{
+    uint8_t p, x;
+    for (p = 0U; p < 8U; p++)
+        for (x = 0U; x < 128U; x++)
+            oled_buf[p][x] = 0U;
+}
+
+/* 8x16 字符: 占 page 与 page+1 两页 */
+static void draw_char(uint16_t x, uint8_t page, char c)
+{
+    uint8_t i, idx;
+    if (c < 0x20 || c > 0x7E) c = '?';
+    idx = (uint8_t)(c - 0x20);
+    for (i = 0U; i < 8U; i++) {
+        if (x + i > 127U) break;
+        oled_buf[page][x + i] = F8x16[idx][i];
+        if (page + 1U < 8U)
+            oled_buf[page + 1U][x + i] = F8x16[idx][8U + i];
+    }
+}
+
+static void draw_str(uint16_t x, uint8_t page, const char *s)
+{
+    while (*s) {
+        if (x > 119U) break;
+        draw_char(x, page, *s);
+        x += 8U;
+        s++;
+    }
+}
+
+/* ==================== MPU6050 ==================== */
+static uint8_t mpu_present;
+static int16_t acc_x, acc_y, acc_z;
+
+#define MPU_PWR_MGMT_1   0x6BU
+#define MPU_SMPLRT_DIV   0x19U
+#define MPU_CONFIG       0x1AU
+#define MPU_GYRO_CONFIG  0x1BU
+#define MPU_ACCEL_CONFIG 0x1CU
+#define MPU_ACCEL_XOUT_H 0x3BU
+#define MPU_WHO_AM_I     0x75U
+
+static uint8_t mpu_init(void)
+{
+    uint8_t v;
+    if (i2c_rreg(&bus1, MPU_ADDR, MPU_WHO_AM_I, &v) != 0U) return 1U;
+    if (v != 0x68U) return 2U;
+
+    i2c_wreg(&bus1, MPU_ADDR, MPU_PWR_MGMT_1, 0x80U);
+    delay_ms(100U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_PWR_MGMT_1, 0x00U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_SMPLRT_DIV, 0x09U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_CONFIG, 0x03U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_GYRO_CONFIG, 0x00U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_ACCEL_CONFIG, 0x00U);
+    return 0U;
+}
+
+static uint8_t mpu_read(void)
+{
+    uint8_t b[14];
+    if (i2c_read(&bus1, MPU_ADDR, MPU_ACCEL_XOUT_H, b, 14U) != 0U) return 1U;
+    acc_x = (int16_t)((b[0] << 8) | b[1]);
+    acc_y = (int16_t)((b[2] << 8) | b[3]);
+    acc_z = (int16_t)((b[4] << 8) | b[5]);
+    return 0U;
+}
+
+/* ==================== MAX30102 ==================== */
+static uint8_t max_present;
+static uint16_t red_buf[100];
+static uint16_t ir_buf[100];
+static uint8_t buf_idx;
+
+/* 波形帧缓存: 攒够 2 个 IR 采样发一帧 (50Hz) */
+static uint16_t wave_ir[2];
+static uint16_t wave_red[2];
+static uint8_t  wave_cnt;
+
+#define MAX_FIFO_WR_PTR  0x04U
+#define MAX_OVF_COUNTER  0x05U
+#define MAX_FIFO_RD_PTR  0x06U
+#define MAX_FIFO_DATA    0x07U
+#define MAX_FIFO_CONFIG  0x08U
+#define MAX_MODE_CONFIG  0x09U
+#define MAX_SPO2_CONFIG  0x0AU
+#define MAX_LED1_PA      0x0CU
+#define MAX_LED2_PA      0x0DU
+#define MAX_PART_ID      0xFFU
+
+static uint8_t max_init(void)
+{
+    uint8_t v;
+
+    if (i2c_rreg(&bus2, MAX_ADDR, MAX_PART_ID, &v) != 0U) return 1U;
+    if (v != 0x15U) return 2U;
+
+    i2c_wreg(&bus2, MAX_ADDR, MAX_MODE_CONFIG, 0x40U);
+    delay_ms(50U);
+    while (1) {
+        if (i2c_rreg(&bus2, MAX_ADDR, MAX_MODE_CONFIG, &v) != 0U) break;
+        if ((v & 0x40U) == 0U) break;
+        delay_ms(10U);
+    }
+    i2c_wreg(&bus2, MAX_ADDR, MAX_FIFO_WR_PTR, 0x00U);
+    i2c_wreg(&bus2, MAX_ADDR, MAX_OVF_COUNTER, 0x00U);
+    i2c_wreg(&bus2, MAX_ADDR, MAX_FIFO_RD_PTR, 0x00U);
+    i2c_wreg(&bus2, MAX_ADDR, MAX_FIFO_CONFIG, 0x4FU);
+    i2c_wreg(&bus2, MAX_ADDR, MAX_MODE_CONFIG, 0x03U);
+    i2c_wreg(&bus2, MAX_ADDR, MAX_SPO2_CONFIG, 0x27U);
+    i2c_wreg(&bus2, MAX_ADDR, MAX_LED1_PA, 0x24U);
+    i2c_wreg(&bus2, MAX_ADDR, MAX_LED2_PA, 0x24U);
+    return 0U;
+}
+
+static uint8_t max_read_fifo(void)
+{
+    uint8_t wr, rd, n, i;
+    uint8_t d[6];
+
+    if (i2c_rreg(&bus2, MAX_ADDR, MAX_FIFO_WR_PTR, &wr) != 0U) return 1U;
+    if (i2c_rreg(&bus2, MAX_ADDR, MAX_FIFO_RD_PTR, &rd) != 0U) return 1U;
+
+    n = (uint8_t)((wr + 32U - rd) % 32U);
+    if (n > 8U) n = 8U;
+
+    for (i = 0U; i < n; i++) {
+        if (i2c_read(&bus2, MAX_ADDR, MAX_FIFO_DATA, d, 6U) != 0U) return 2U;
+        red_buf[buf_idx] = (uint16_t)(((d[0] << 16) | (d[1] << 8) | d[2]) & 0x3FFFFU);
+        ir_buf[buf_idx]  = (uint16_t)(((d[3] << 16) | (d[4] << 8) | d[5]) & 0x3FFFFU);
+        buf_idx = (uint8_t)((buf_idx + 1U) % 100U);
+
+        if (wave_cnt < 2U) {
+            uint8_t last = (uint8_t)((buf_idx + 99U) % 100U);
+            wave_ir[wave_cnt]  = ir_buf[last];
+            wave_red[wave_cnt] = red_buf[last];
+            wave_cnt++;
+        }
+    }
+    return 0U;
+}
+
+/* ==================== 算法 ==================== */
+static float spo2_val, pr_val, pi_val;
+static uint8_t spo2_valid;
+static float pitch_val, roll_val;
+
+static int16_t isqrt32(int32_t v)
+{
+    int16_t r = 0;
+    if (v <= 0) return 0;
+    while ((int32_t)(r + 1) * (r + 1) <= v && r < 32767) r++;
+    return r;
+}
+
+static void calc_spo2(void)
+{
+    uint32_t sum_r = 0U, sum_ir = 0U;
+    uint16_t min_r = 0xFFFFU, max_r = 0U, min_ir = 0xFFFFU, max_ir = 0U;
+    uint8_t i;
+    float dc_r, dc_ir, ac_r, ac_ir, R;
+
+    for (i = 0U; i < 100U; i++) {
+        sum_r += red_buf[i];
+        sum_ir += ir_buf[i];
+        if (red_buf[i] < min_r) min_r = red_buf[i];
+        if (red_buf[i] > max_r) max_r = red_buf[i];
+        if (ir_buf[i] < min_ir) min_ir = ir_buf[i];
+        if (ir_buf[i] > max_ir) max_ir = ir_buf[i];
+    }
+
+    dc_r  = (float)sum_r / 100.0f;
+    dc_ir = (float)sum_ir / 100.0f;
+    if (dc_r < 1000.0f || dc_ir < 1000.0f) { spo2_valid = 0U; return; }
+
+    ac_r  = (float)(max_r - min_r);
+    ac_ir = (float)(max_ir - min_ir);
+    if (ac_ir < 10.0f) { spo2_valid = 0U; return; }
+
+    R = (ac_r / dc_r) / (ac_ir / dc_ir);
+    spo2_val = 110.0f - 25.0f * R;
+    if (spo2_val > 100.0f) spo2_val = 100.0f;
+    if (spo2_val < 70.0f)  spo2_val = 70.0f;
+
+    pi_val = (ac_ir / dc_ir) * 100.0f;
+    if (pi_val > 20.0f) pi_val = 20.0f;
+
+    {
+        uint8_t crossings = 0U;
+        float thr = dc_ir;
+        uint8_t below = (ir_buf[0] < thr) ? 1U : 0U;
+        for (i = 1U; i < 100U; i++) {
+            uint8_t nb = (ir_buf[i] < thr) ? 1U : 0U;
+            if (below && !nb) crossings++;
+            below = nb;
+        }
+        pr_val = (float)crossings * 60.0f;
+        if (pr_val < 30.0f || pr_val > 220.0f) pr_val = 0.0f;
+    }
+
+    spo2_valid = (pr_val > 0.0f) ? 1U : 0U;
+}
+
+static void calc_angles(void)
+{
+    float ax = (float)acc_x, ay = (float)acc_y, az = (float)acc_z;
+    float mag = (float)isqrt32((int32_t)(ay * ay + az * az));
+    if (mag > 1.0f) {
+        pitch_val = (-ax / mag) * 57.3f;
+        if (pitch_val > 90.0f) pitch_val = 90.0f;
+        if (pitch_val < -90.0f) pitch_val = -90.0f;
+    }
+    mag = (float)isqrt32((int32_t)(ax * ax + az * az));
+    if (mag > 1.0f) {
+        roll_val = (ay / mag) * 57.3f;
+        if (roll_val > 90.0f) roll_val = 90.0f;
+        if (roll_val < -90.0f) roll_val = -90.0f;
+    }
+}
+
+/* ==================== 跌倒检测（三段式） ==================== */
+typedef enum {
+    FALL_IDLE = 0,
+    FALL_FREEFALL,
+    FALL_IMPACT,
+    FALL_FALLEN,
+    FALL_ALARM
+} fall_state_t;
+
+static fall_state_t fall_state;
+static uint16_t fall_timer;
+static uint8_t fall_event;
+
+#define FALL_FREE_G     0.60f
+#define FALL_IMPACT_G   2.50f
+#define FALL_ANGLE_DEG  60.0f
+#define FALL_FREE_MIN   3U
+#define FALL_FREE_WIN   100U
+#define FALL_ANGLE_WIN  200U
+#define FALL_CONFIRM    300U
+
+static void fall_update(void)
+{
+    float ax = (float)acc_x, ay = (float)acc_y, az = (float)acc_z;
+    float g = (float)isqrt32((int32_t)(ax * ax + ay * ay + az * az)) / 16384.0f;
+    uint8_t tilted = (pitch_val > FALL_ANGLE_DEG || pitch_val < -FALL_ANGLE_DEG ||
+                      roll_val  > FALL_ANGLE_DEG || roll_val  < -FALL_ANGLE_DEG);
+
+    fall_event = 0U;
+
+    switch (fall_state) {
+    case FALL_IDLE:
+        if (g < FALL_FREE_G) { fall_state = FALL_FREEFALL; fall_timer = 0U; }
+        break;
+
+    case FALL_FREEFALL:
+        fall_timer++;
+        if (g > FALL_IMPACT_G) {
+            fall_state = FALL_IMPACT;
+            fall_timer = 0U;
+        } else if (g > FALL_FREE_G && fall_timer < FALL_FREE_MIN) {
+            fall_state = FALL_IDLE;
+        }
+        if (fall_timer > FALL_FREE_WIN) fall_state = FALL_IDLE;
+        break;
+
+    case FALL_IMPACT:
+        fall_timer++;
+        if (tilted) { fall_state = FALL_FALLEN; fall_timer = 0U; }
+        else if (fall_timer > FALL_ANGLE_WIN) fall_state = FALL_IDLE;
+        break;
+
+    case FALL_FALLEN:
+        fall_timer++;
+        if (fall_timer > FALL_CONFIRM) {
+            fall_state = FALL_ALARM;
+            fall_timer = 0U;
+            fall_event = 1U;
+            BEEP_ON();
+        } else if (!tilted && g > 0.8f && g < 1.2f) {
+            fall_state = FALL_IDLE;
+        }
+        break;
+
+    case FALL_ALARM:
+        if (fall_timer < 60000U) fall_timer++;
+        break;
+    }
+}
+
+static void fall_clear_alarm(void)
+{
+    BEEP_OFF();
+    fall_state = FALL_IDLE;
+    fall_timer = 0U;
+}
+
+static void fall_manual_trigger(void)
+{
+    fall_state = FALL_ALARM;
+    fall_timer = 0U;
+    fall_event = 1U;
+    BEEP_ON();
+}
+
+static const char *fall_state_str(void)
+{
+    switch (fall_state) {
+    case FALL_FREEFALL: return "FREE";
+    case FALL_IMPACT:   return "HIT";
+    case FALL_FALLEN:   return "FALLEN";
+    case FALL_ALARM:    return "ALARM";
+    default:            return "OK";
+    }
+}
+
+/* ==================== 按键 ==================== */
+#define KEY_NUM  4U
+static uint8_t  key_prev[KEY_NUM];
+static uint16_t key_hold[KEY_NUM];
+
+/* 0=无事件  1=短按(松开)  2=长按(2s 触发一次) */
+static uint8_t key_poll(uint8_t idx, uint8_t down)
+{
+    uint8_t ev = 0U;
+
+    if (down) {
+        if (key_hold[idx] < 60000U) key_hold[idx] += 10U;
+        if (key_prev[idx] && key_hold[idx] == 200U) ev = 2U;
+    } else {
+        if (key_prev[idx] && key_hold[idx] >= 20U && key_hold[idx] < 200U) ev = 1U;
+        key_hold[idx] = 0U;
+    }
+    key_prev[idx] = down;
+    return ev;
+}
+
+/* ==================== UART ==================== */
+static void uart_init(void)
+{
+    RCC_APB1ENR |= (1U << 17);
+    USART2_BRR = 833U;
+    USART2_CR1 = (1U << 13) | (1U << 3) | (1U << 2);
+}
+
+static void uart_set_baud(uint32_t baud)
+{
+    USART2_BRR = 8000000U / baud;
+}
+
+static void uart_send_str(const char *str)
+{
+    while (*str) {
+        uint32_t guard = 0U;
+        while ((USART2_SR & (1U << 7)) == 0U) { if (++guard > 200000U) return; }
+        USART2_DR = (uint8_t)*str++;
+    }
+}
+
+static uint8_t uart_read_timeout(uint8_t *buf, uint8_t max, uint32_t ms)
+{
+    uint8_t n = 0U;
+    uint32_t waited = 0U;
+    while (waited < ms && n < max) {
+        if (USART2_SR & (1U << 5)) {
+            buf[n++] = (uint8_t)USART2_DR;
+        } else {
+            delay_ms(1U);
+            waited++;
+        }
+    }
+    return n;
+}
+
+static uint8_t mem_contains(const uint8_t *buf, uint8_t n, const char *pat)
+{
+    uint8_t plen = 0U, i, j;
+    while (pat[plen]) plen++;
+    if (plen == 0U || n < plen) return 0U;
+    for (i = 0U; (uint8_t)(i + plen) <= n; i++) {
+        for (j = 0U; j < plen; j++) {
+            if (buf[i + j] != (uint8_t)pat[j]) break;
+        }
+        if (j == plen) return 1U;
+    }
+    return 0U;
+}
+
+static void uart_send(const uint8_t *buf, uint16_t n)
+{
+    uint16_t i;
+    uint32_t guard;
+    for (i = 0U; i < n; i++) {
+        guard = 0U;
+        while ((USART2_SR & (1U << 7)) == 0U) { if (++guard > 200000U) return; }
+        USART2_DR = buf[i];
+    }
+}
+
+static void proto_send(uint8_t type, const uint8_t *payload, uint8_t len)
+{
+    uint8_t frame[32];
+    uint8_t i, sum = 0U;
+    if (len > 26U) return;
+    frame[0] = 0xAAU; frame[1] = 0x55U; frame[2] = type; frame[3] = len;
+    for (i = 0U; i < len; i++) frame[4U + i] = payload[i];
+    for (i = 0U; i < (uint8_t)(4U + len); i++) sum = (uint8_t)(sum + frame[i]);
+    frame[4U + len] = sum;
+    uart_send(frame, (uint16_t)(5U + len));
+}
+
+static void send_data_frame(void)
+{
+    uint8_t p[6];
+    p[0] = (uint8_t)(spo2_val + 0.5f);
+    p[1] = (uint8_t)(pr_val + 0.5f);
+    p[2] = (uint8_t)(pi_val * 10.0f + 0.5f);
+    p[3] = (uint8_t)(pitch_val + 90.0f);
+    p[4] = (uint8_t)(roll_val + 90.0f);
+    p[5] = (uint8_t)fall_state;
+    proto_send(0x01U, p, 6U);
+}
+
+/* 波形帧: AA 55 03 0C | ir0[3] red0[3] ir1[3] red1[3] | sum */
+static void send_wave_frame(void)
+{
+    uint8_t p[12];
+    uint16_t v;
+    uint8_t k;
+
+    for (k = 0U; k < 2U; k++) {
+        v = wave_ir[k];
+        p[k * 6U + 0U] = (uint8_t)((v >> 16) & 0x03U);
+        p[k * 6U + 1U] = (uint8_t)(v >> 8);
+        p[k * 6U + 2U] = (uint8_t)v;
+
+        v = wave_red[k];
+        p[k * 6U + 3U] = (uint8_t)((v >> 16) & 0x03U);
+        p[k * 6U + 4U] = (uint8_t)(v >> 8);
+        p[k * 6U + 5U] = (uint8_t)v;
+    }
+
+    proto_send(0x03U, p, 12U);
+    wave_cnt = 0U;
+}
+
+/* ==================== JDY-31 AT 配置 ==================== */
+static uint8_t at_diag_buf[24];
+static uint8_t at_diag_len;
+static uint8_t at_try_idx;
+
+static void at_record(const uint8_t *buf, uint8_t n, uint8_t attempt)
+{
+    uint8_t i;
+    at_try_idx = attempt;
+    at_diag_len = (n > (uint8_t)sizeof(at_diag_buf)) ? (uint8_t)sizeof(at_diag_buf) : n;
+    for (i = 0U; i < at_diag_len; i++) at_diag_buf[i] = buf[i];
+}
+
+/* 返回: 0=失败/无响应  1=本次改成 19200 成功  2=本来就是 19200  3=写入存疑 */
+static uint8_t jdy_at_configure(void)
+{
+    /* 不同批次 JDY-31 的 AT 格式不同，全部试一遍 */
+    static const char *forms[4] = { "AT\r\n", "AT\n", "AT", "AT+\r\n" };
+    uint8_t fi, attempt;
+    uint8_t buf[40];
+    uint8_t n;
+
+    for (fi = 0U; fi < 4U; fi++) {
+        for (attempt = 0U; attempt < 2U; attempt++) {
+            delay_ms(280U);
+            uart_send_str(forms[fi]);
+            /* 等最后一位移出 */
+            {
+                uint32_t guard = 0U;
+                while ((USART2_SR & (1U << 6)) == 0U) { if (++guard > 200000U) break; }
+            }
+            n = uart_read_timeout(buf, sizeof(buf), 500U);
+            at_record(buf, n, fi);
+
+            if (mem_contains(buf, n, "OK")) {
+                uint8_t wrote;
+                uart_send_str("AT+BAUD4\r\n");
+                {
+                    uint32_t g2 = 0U;
+                    while ((USART2_SR & (1U << 6)) == 0U) { if (++g2 > 200000U) break; }
+                }
+                n = uart_read_timeout(buf, sizeof(buf), 900U);
+                wrote = mem_contains(buf, n, "OK");
+
+                uart_set_baud(19200U);
+                delay_ms(200U);
+                uart_send_str("AT\r\n");
+                n = uart_read_timeout(buf, sizeof(buf), 600U);
+                if (mem_contains(buf, n, "OK")) return 1U;
+
+                uart_set_baud(9600U);
+                return wrote ? 3U : 0U;
+            }
+        }
+    }
+
+    return 0U;
+}
+
+/* ==================== 显示 ==================== */
+static char line_buf[24];
+
+static void fmt_u(char *dst, uint16_t v, uint8_t width)
+{
+    char tmp[6];
+    uint8_t n = 0U, i;
+    if (v == 0U) tmp[n++] = ' ';
+    while (v > 0U && n < 6U) { tmp[n++] = (char)('0' + (v % 10U)); v /= 10U; }
+    while (n < width && n < 6U) tmp[n++] = ' ';
+    for (i = 0U; i < n; i++) dst[i] = tmp[n - 1U - i];
+    dst[n] = '\0';
+}
+
+static void fmt_s(char *dst, int16_t v, uint8_t width)
+{
+    char tmp[7];
+    uint8_t n = 0U, i;
+    uint16_t u = (v < 0) ? (uint16_t)(-v) : (uint16_t)v;
+    if (u == 0U) tmp[n++] = '0';
+    while (u > 0U && n < 6U) { tmp[n++] = (char)('0' + (u % 10U)); u /= 10U; }
+    if (v < 0) tmp[n++] = '-';
+    while (n < width && n < 7U) tmp[n++] = ' ';
+    for (i = 0U; i < n; i++) dst[i] = tmp[n - 1U - i];
+    dst[n] = '\0';
+}
+
+static void draw_page_main(void)
+{
+    char t[10];
+
+    draw_str(0U, 0U, "PPG v5");
+    draw_str(48U, 0U, measure_on ? "MEAS" : "STOP");
+    draw_str(96U, 0U, "1/3");
+
+    if (spo2_valid) {
+        draw_str(0U, 2U, "SpO2");
+        fmt_u(line_buf, (uint16_t)(spo2_val + 0.5f), 3U);
+        draw_str(40U, 2U, line_buf);
+        draw_str(64U, 2U, "%");
+    } else {
+        draw_str(0U, 2U, "SpO2 --");
+    }
+
+    if (spo2_valid) {
+        draw_str(0U, 4U, "PR");
+        fmt_u(line_buf, (uint16_t)(pr_val + 0.5f), 3U);
+        draw_str(24U, 4U, line_buf);
+        draw_str(56U, 4U, "bpm");
+    } else if (max_present) {
+        draw_str(0U, 4U, "-- no finger --");
+    } else {
+        draw_str(0U, 4U, "-- no sensor --");
+    }
+
+    draw_str(0U, 6U, "P");
+    fmt_s(t, (int16_t)pitch_val, 4U);
+    draw_str(8U, 6U, t);
+    draw_str(48U, 6U, "R");
+    fmt_s(t, (int16_t)roll_val, 4U);
+    draw_str(56U, 6U, t);
+    draw_str(96U, 6U, fall_state_str());
+}
+
+static void draw_page_imu(void)
+{
+    char t[10];
+
+    draw_str(0U, 0U, "IMU MPU6050");
+    draw_str(96U, 0U, "2/3");
+
+    draw_str(0U, 2U, "Pitch");
+    fmt_s(t, (int16_t)pitch_val, 4U);
+    draw_str(48U, 2U, t);
+    draw_str(80U, 2U, "deg");
+
+    draw_str(0U, 4U, "Roll ");
+    fmt_s(t, (int16_t)roll_val, 4U);
+    draw_str(48U, 4U, t);
+    draw_str(80U, 4U, "deg");
+
+    draw_str(0U, 6U, "State:");
+    draw_str(56U, 6U, fall_state_str());
+    draw_str(104U, 6U, mpu_present ? "ON" : "--");
+}
+
+static void draw_page_sys(void)
+{
+    draw_str(0U, 0U, "SYSTEM");
+    draw_str(96U, 0U, "3/3");
+
+    draw_str(0U, 2U, "OLED: ");
+    draw_str(64U, 2U, oled_present ? "OK" : "--");
+
+    draw_str(0U, 4U, "MPU : ");
+    draw_str(64U, 4U, mpu_present ? "OK" : "--");
+
+    draw_str(0U, 6U, "MAX : ");
+    draw_str(64U, 6U, max_present ? "OK" : "--");
+}
+
+static void draw_screen(void)
+{
+    oled_clear();
+    if (page_idx == 0U)      draw_page_main();
+    else if (page_idx == 1U) draw_page_imu();
+    else                     draw_page_sys();
+    oled_flush();
+}
+
+/* ==================== 主函数 ==================== */
+int main(void)
+{
+    uint8_t r, i;
+    uint8_t sec_cnt = 0U, disp_cnt = 0U;
+
+    gpio_init();
+    i2c_init(&bus1);
+    i2c_init(&bus2);
+    uart_init();
+
+    delay_ms(400U);     /* 等 OLED 与 JDY-31 电源稳定 */
+
+    /* ---- OLED 先初始化，供 AT 诊断使用 ---- */
+    oled_present = 0U;
+    r = i2c_write(&bus1, OLED_ADDR, oled_init_seq, (uint16_t)sizeof(oled_init_seq));
+    if (r == 0U) oled_present = 1U;
+    else {
+        r = i2c_write(&bus1, OLED_ADDR | 0x02U, oled_init_seq, (uint16_t)sizeof(oled_init_seq));
+        if (r == 0U) oled_present = 1U;
+    }
+
+    if (oled_present) {
+        oled_clear();
+        draw_str(0U, 0U, "AT probe...");
+        oled_flush();
+    }
+
+    /* ---- JDY-31 AT 配置 ---- */
+    {
+        uint8_t rc = jdy_at_configure();
+        uint8_t blinks;
+        uint8_t k;
+
+        if (rc == 1U)      blinks = 3U;
+        else if (rc == 2U) blinks = 2U;
+        else               blinks = 1U;
+
+        for (k = 0U; k < blinks; k++) {
+            LED_ON();
+            delay_ms(180U);
+            LED_OFF();
+            delay_ms(280U);
+        }
+
+        /* ---- 诊断页: rc / try / 收到的原始字节 ---- */
+        if (oled_present) {
+            static const char hexdig[] = "0123456789ABCDEF";
+            char line[18];
+            uint8_t idx, bi, half;
+
+            oled_clear();
+
+            /* page 0: rc */
+            draw_str(0U, 0U, "AT rc=");
+            line[0] = (char)('0' + (rc % 10U));
+            line[1] = ' ';
+            line[2] = 'f';
+            line[3] = 'm';
+            line[4] = 't';
+            line[5] = (char)('0' + (at_try_idx % 10U));
+            line[6] = 0;
+            draw_str(48U, 0U, line);
+
+            /* page 2: 长度 */
+            draw_str(0U, 2U, "len=");
+            line[0] = (char)('0' + ((at_diag_len / 10U) % 10U));
+            line[1] = (char)('0' + (at_diag_len % 10U));
+            line[2] = 0;
+            draw_str(32U, 2U, line);
+
+            /* page 4/6: 十六进制, 每行 8 字节 */
+            for (half = 0U; half < 2U; half++) {
+                idx = 0U;
+                for (k = 0U; k < 8U; k++) {
+                    bi = (uint8_t)(half * 8U + k);
+                    if (bi >= at_diag_len) break;
+                    line[idx++] = hexdig[(at_diag_buf[bi] >> 4) & 0x0FU];
+                    line[idx++] = hexdig[at_diag_buf[bi] & 0x0FU];
+                    line[idx++] = ' ';
+                }
+                if (idx == 0U) {
+                    line[idx++] = '-';
+                    line[idx++] = '-';
+                }
+                line[idx] = 0;
+                draw_str(0U, (uint8_t)(4U + half * 2U), line);
+            }
+
+            oled_flush();
+            delay_ms(6000U);
+        }
+    }
+
+    delay_ms(300U);
+
+    if (oled_present) {
+        oled_clear();
+        draw_str(0U, 0U, "PPG v5 boot");
+        draw_str(0U, 2U, "scan I2C1/2");
+        oled_flush();
+    }
+
+    for (i = 0U; i < 100U; i++) { red_buf[i] = 0U; ir_buf[i] = 0U; }
+    buf_idx = 0U;
+
+    mpu_present = (mpu_init() == 0U) ? 1U : 0U;
+    max_present = (max_init() == 0U) ? 1U : 0U;
+
+    if (oled_present) {
+        oled_clear();
+        draw_str(0U, 0U, "MPU6050:");
+        draw_str(64U, 0U, mpu_present ? "OK" : "MISS");
+        draw_str(0U, 2U, "MAX30102:");
+        draw_str(72U, 2U, max_present ? "OK" : "MISS");
+        draw_str(0U, 4U, "I2C1 0x68:");
+        draw_str(80U, 4U, i2c_ping(&bus1, 0x68U) == 0U ? "ACK" : "---");
+        draw_str(0U, 6U, "I2C2 0x57:");
+        draw_str(80U, 6U, i2c_ping(&bus2, 0x57U) == 0U ? "ACK" : "---");
+        oled_flush();
+    }
+    delay_ms(1200U);
+
+    fall_state = FALL_IDLE;
+    fall_timer = 0U;
+    page_idx = 0U;
+    measure_on = 1U;
+
+    uint8_t wave_tick = 0U;
+
+    while (1) {
+        uint8_t e;
+
+        /* ---- 按键 ---- */
+        e = key_poll(0U, KEY1_DOWN());
+        if (e == 1U) measure_on = measure_on ? 0U : 1U;
+
+        e = key_poll(1U, KEY2_DOWN());
+        if (e == 1U) page_idx = (uint8_t)((page_idx + 1U) % 3U);
+
+        e = key_poll(2U, KEY3_DOWN());
+        if (e == 1U && fall_state == FALL_ALARM) fall_clear_alarm();
+
+        e = key_poll(3U, KEY4_DOWN());
+        if (e == 2U) fall_manual_trigger();
+
+        /* ---- 报警时蜂鸣器 2Hz 间歇 ---- */
+        if (fall_state == FALL_ALARM) {
+            if (((fall_timer / 25U) & 1U) == 0U) BEEP_ON();
+            else                                 BEEP_OFF();
+        }
+
+        /* ---- 传感器 ---- */
+        if (mpu_present) {
+            if (mpu_read() == 0U) {
+                calc_angles();
+                fall_update();
+                if (fall_event) {
+                    uint8_t ev = 1U;
+                    proto_send(0x02U, &ev, 1U);
+                }
+            }
+        }
+        if (max_present && measure_on) (void)max_read_fifo();
+
+        /* 波形帧: 每 20ms 一帧 (2 个采样, 50Hz) */
+        wave_tick++;
+        if (wave_tick >= 4U) {      /* 25Hz: 每 40ms 一帧 (2 组 IR+RED) */
+            wave_tick = 0U;
+            if (max_present && wave_cnt >= 2U) send_wave_frame();
+        }
+
+        sec_cnt++;
+        if (sec_cnt >= 100U) {
+            sec_cnt = 0U;
+            if (max_present && measure_on) calc_spo2();
+            send_data_frame();
+        }
+
+        disp_cnt++;
+        if (disp_cnt >= 10U) {
+            disp_cnt = 0U;
+            draw_screen();
+            LED_ON();
+        } else {
+            LED_OFF();
+        }
+
+        delay_ms(10U);
+    }
+}
