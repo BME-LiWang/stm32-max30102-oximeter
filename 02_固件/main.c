@@ -1,0 +1,2714 @@
+/*
+ * PPG_STM32 转接板 v5 —— 血氧 + 跌倒监测 初版固件
+ * STM32F103C8T6 @ 8MHz HSI
+ *
+ * I2C1 (PB6/PB7)  : OLED SH1106 0x3C, MPU6050 0x68
+ * I2C2 (PB10/PB11): MAX30102 0x57
+ * USART2 (PA2/PA3): JDY-31 9600
+ * BEEP PB13, LED PC13, KEY1-4 = PB1/PA6/PA8/PB15
+ */
+
+#include <stdint.h>
+
+/* ==================== 寄存器 ==================== */
+#define RCC_APB1ENR   (*(volatile uint32_t *)0x4002101CU)
+#define RCC_APB2ENR   (*(volatile uint32_t *)0x40021018U)
+#define RCC_CR        (*(volatile uint32_t *)0x40021000U)
+#define RCC_CFGR      (*(volatile uint32_t *)0x40021004U)
+#define FLASH_ACR     (*(volatile uint32_t *)0x40022000U)
+
+#define GPIOA_CRL     (*(volatile uint32_t *)0x40010800U)
+#define GPIOA_CRH     (*(volatile uint32_t *)0x40010804U)
+#define GPIOA_IDR     (*(volatile uint32_t *)0x40010808U)
+#define GPIOA_ODR     (*(volatile uint32_t *)0x4001080CU)
+
+#define GPIOB_CRL     (*(volatile uint32_t *)0x40010C00U)
+#define GPIOB_CRH     (*(volatile uint32_t *)0x40010C04U)
+#define GPIOB_IDR     (*(volatile uint32_t *)0x40010C08U)
+#define GPIOB_ODR     (*(volatile uint32_t *)0x40010C0CU)
+
+#define GPIOC_CRH     (*(volatile uint32_t *)0x40011004U)
+#define GPIOC_ODR     (*(volatile uint32_t *)0x4001100CU)
+
+#define I2C1_CR1      (*(volatile uint32_t *)0x40005400U)
+#define I2C1_CR2      (*(volatile uint32_t *)0x40005404U)
+#define I2C1_DR       (*(volatile uint32_t *)0x40005410U)
+#define I2C1_SR1      (*(volatile uint32_t *)0x40005414U)
+#define I2C1_SR2      (*(volatile uint32_t *)0x40005418U)
+#define I2C1_CCR      (*(volatile uint32_t *)0x4000541CU)
+#define I2C1_TRISE    (*(volatile uint32_t *)0x40005420U)
+
+#define I2C2_CR1      (*(volatile uint32_t *)0x40005800U)
+#define I2C2_CR2      (*(volatile uint32_t *)0x40005804U)
+#define I2C2_DR       (*(volatile uint32_t *)0x40005810U)
+#define I2C2_SR1      (*(volatile uint32_t *)0x40005814U)
+#define I2C2_SR2      (*(volatile uint32_t *)0x40005818U)
+#define I2C2_CCR      (*(volatile uint32_t *)0x4000581CU)
+#define I2C2_TRISE    (*(volatile uint32_t *)0x40005820U)
+
+#define USART2_SR     (*(volatile uint32_t *)0x40004400U)
+#define USART2_DR     (*(volatile uint32_t *)0x40004404U)
+#define USART2_BRR    (*(volatile uint32_t *)0x40004408U)
+#define USART2_CR1    (*(volatile uint32_t *)0x4000440CU)
+
+#define SYSTICK_CTRL  (*(volatile uint32_t *)0xE000E010U)
+#define SYSTICK_LOAD  (*(volatile uint32_t *)0xE000E014U)
+#define SYSTICK_VAL   (*(volatile uint32_t *)0xE000E018U)
+
+#define LED_ON()      (GPIOC_ODR &= ~(1U << 13))
+#define LED_OFF()     (GPIOC_ODR |=  (1U << 13))
+#define BEEP_ON()     (GPIOB_ODR |=  (1U << 13))
+#define BEEP_OFF()    (GPIOB_ODR &= ~(1U << 13))
+
+#define KEY1_DOWN()   ((GPIOB_IDR & (1U << 1))  == 0U)
+#define KEY2_DOWN()   ((GPIOA_IDR & (1U << 6))  == 0U)
+#define KEY3_DOWN()   ((GPIOA_IDR & (1U << 8))  == 0U)
+#define KEY4_DOWN()   ((GPIOB_IDR & (1U << 15)) == 0U)
+
+#define OLED_ADDR     0x78U
+#define MPU_ADDR      0xD0U
+#define MAX_ADDR      0xAEU
+
+/* ==================== I2C 总线 ==================== */
+typedef struct {
+    volatile uint32_t *CR1, *CR2, *DR, *SR1, *SR2, *CCR, *TRISE;
+    uint32_t apb1en;
+    uint32_t guard_max;      /* 超时保护上限, 扫描时可临时调小 */
+    uint32_t ccr;            /* 分频值: 8MHz 下 40=100kHz, 80=50kHz */
+} i2c_bus_t;
+
+static i2c_bus_t bus1 = { &I2C1_CR1, &I2C1_CR2, &I2C1_DR, &I2C1_SR1, &I2C1_SR2, &I2C1_CCR, &I2C1_TRISE, (1U << 21), 200000U, 80U };
+static i2c_bus_t bus2 = { &I2C2_CR1, &I2C2_CR2, &I2C2_DR, &I2C2_SR1, &I2C2_SR2, &I2C2_CCR, &I2C2_TRISE, (1U << 22), 200000U, 40U };
+
+/* 时钟换算用的全局量: 声明必须早于 clock_init 与所有外设初始化 */
+#define TICK_PER_MS 8011U          /* 默认 8MHz(HSI): 1ms = 8011 个内核周期 */
+static uint32_t g_tick_per_ms = TICK_PER_MS;
+static uint32_t g_hclk_khz    = 8000U;   /* 当前 HCLK, 供延时换算 */
+static uint32_t g_pclk1_khz   = 8000U;   /* APB1 (I2C1/UART2 的时钟) */
+
+/* ==================== 时钟: 8MHz HSI/HSE → 72MHz ====================
+   先把 HSE 8MHz 晶振启振, 成功则 PLL ×9 = 72MHz, APB1 ÷2 = 36MHz;
+   晶振起不来(比如空焊)就留在 8MHz HSI, 所有外设按 g_hclk_khz 运行时换算,
+   不会因为"以为自己是 72M"而把 I2C 拉飞、串口波特率跑偏。 */
+static void clock_init(void)
+{
+    uint32_t t;
+
+    RCC_CR |= (1U << 16);                     /* HSEON */
+    t = 0U;
+    while (((RCC_CR & (1U << 17)) == 0U) && t < 400000U) t++;
+
+    if ((RCC_CR & (1U << 17)) == 0U) {        /* 没晶振: 保持 HSI 8MHz */
+        g_hclk_khz    = 8000U;
+        g_pclk1_khz   = 8000U;
+        g_tick_per_ms = 8011U;
+        return;
+    }
+
+    FLASH_ACR = (1U << 4) | 2U;               /* 预取使能 + 2 等待周期(72MHz 必须) */
+    /* HPRE=÷1, PPRE1=÷2(36MHz), PPRE2=÷1, ADCPRE=÷6, PLLSRC=HSE, PLLMUL=×9 */
+    RCC_CFGR = (0x4U << 8) | (0x2U << 14) | (1U << 16) | (0x8U << 18);
+    RCC_CR  |= (1U << 24);                    /* PLLON */
+    t = 0U;
+    while (((RCC_CR & (1U << 25)) == 0U) && t < 400000U) t++;
+
+    RCC_CFGR = (RCC_CFGR & ~0x3U) | 0x2U;      /* SW = PLL */
+    t = 0U;
+    while (((RCC_CFGR & (0xCU)) != 0x8U) && t < 400000U) t++;   /* 等 SWS=PLL */
+
+    g_hclk_khz    = 72000U;
+    g_pclk1_khz   = 36000U;
+    g_tick_per_ms = 72072U;                   /* 8MHz 实测 8011 → 等比放大 9 倍 */
+}
+
+/* ==================== 周期时钟 (DWT) ==================== */
+/* SysTick 的 VAL 无法从 SWD 侧读到, 改用内核 DWT 周期计数器做时间基准:
+   自由累加 CYCCNT 的差值, 换算成毫秒, 采样/刷屏/上报全按真实时间节拍。 */
+#define DEMCR_REG     (*(volatile uint32_t *)0xE000EDFCU)
+#define DWT_CTRL_REG  (*(volatile uint32_t *)0xE0001000U)
+#define DWT_CYCCNT    (*(volatile uint32_t *)0xE0001004U)   /* TICK_PER_MS 与 g_tick_per_ms 已在文件前部定义 */
+
+static uint32_t cyc_prev = 0U;
+static uint64_t cyc_acc  = 0U;
+static uint8_t  tick_on  = 0U;
+volatile uint32_t dbg_cyc;   /* CYCCNT 原始值, 供外部标定每毫秒周期数 */
+
+/* ---- HardFault 现场记录: 出错 PC/LR/CFSR/R12 存进 dbg_hf[], SWD 读回后用 addr2line 直接定位到代码行 ---- */
+volatile uint32_t dbg_hf[4];
+void HardFault_Handler(void) __attribute__((naked, used));
+void HardFault_Handler(void)
+{
+    __asm volatile(
+        "tst   lr, #4\n"
+        "ite   eq\n"
+        "mrseq r0, msp\n"
+        "mrsne r0, psp\n"
+        "ldr   r2, =dbg_hf\n"
+        "ldr   r1, [r0, #24]\n"        /* 出错 PC */
+        "str   r1, [r2, #0]\n"
+        "ldr   r1, [r0, #20]\n"        /* 出错 LR */
+        "str   r1, [r2, #4]\n"
+        "ldr   r1, =0xE000ED28\n"      /* CFSR */
+        "ldr   r3, [r1]\n"
+        "str   r3, [r2, #8]\n"
+        "ldr   r1, [r0, #16]\n"        /* R12 */
+        "str   r1, [r2, #12]\n"
+        "b     .\n");
+}
+
+static void tick_start(void)
+{
+    DEMCR_REG   |= (1U << 24);      /* TRCENA */
+    DWT_CYCCNT   = 0U;
+    DWT_CTRL_REG |= 1U;             /* CYCCNTENA */
+    cyc_prev = 0U;
+    cyc_acc  = 0U;
+    tick_on  = 1U;
+}
+
+static uint32_t now_ms(void)
+{
+    uint32_t v, d;
+    if (!tick_on) return (uint32_t)(cyc_acc / g_tick_per_ms);
+    v = DWT_CYCCNT;
+    dbg_cyc = v;
+    if (v >= cyc_prev) d = v - cyc_prev;
+    else               d = (0xFFFFFFFFU - cyc_prev) + v + 1U;
+    cyc_prev = v;
+    cyc_acc += d;
+    return (uint32_t)(cyc_acc / g_tick_per_ms);
+}
+
+/* ==================== 延时 ==================== */
+static void delay_ms(uint32_t ms)
+{
+    uint32_t t0 = now_ms();
+    while ((now_ms() - t0) < ms) { }
+}
+
+/* ==================== GPIO ==================== */
+static void gpio_init(void)
+{
+    RCC_APB2ENR |= (1U << 0) | (1U << 2) | (1U << 3) | (1U << 4);
+
+    GPIOB_ODR |=  (0x03U << 6);                                   /* 先把 PB6/PB7 置高, 避免 OLED 总线 AF 开漏时被拉低 */
+    GPIOB_CRL &= ~(0xFFU << 24);  GPIOB_CRL |= (0xFFU << 24);   /* PB6/PB7 AF OD */
+    GPIOB_ODR |=  (0x03U << 10);                                  /* 先把 PB10/PB11 置高, 避免 AF 开漏时被拉低 */
+    GPIOB_CRH &= ~(0xFFU << 8);   GPIOB_CRH |= (0xFFU << 8);    /* PB10/PB11 AF OD */
+
+    GPIOA_CRL &= ~(0xFU << 8);    GPIOA_CRL |= (0xBU << 8);     /* PA2 AF PP */
+    GPIOA_CRL &= ~(0xFU << 12);   GPIOA_CRL |= (0x4U << 12);    /* PA3 floating */
+
+    GPIOC_CRH &= ~(0xFU << 20);   GPIOC_CRH |= (0x2U << 20);    /* PC13 out */
+    LED_OFF();
+
+    GPIOB_CRH &= ~(0xFU << 20);   GPIOB_CRH |= (0x2U << 20);    /* PB13 out */
+    BEEP_OFF();
+
+    GPIOB_CRL &= ~(0xFU << 4);    GPIOB_CRL |= (0x8U << 4);  GPIOB_ODR |= (1U << 1);
+    GPIOA_CRL &= ~(0xFU << 24);   GPIOA_CRL |= (0x8U << 24); GPIOA_ODR |= (1U << 6);
+    GPIOA_CRH &= ~(0xFU << 0);    GPIOA_CRH |= (0x8U << 0);  GPIOA_ODR |= (1U << 8);
+    GPIOB_CRH &= ~(0xFU << 28);   GPIOB_CRH |= (0x8U << 28); GPIOB_ODR |= (1U << 15);
+}
+
+/* ==================== I2C ==================== */
+static void i2c_init(i2c_bus_t *b)
+{
+    volatile uint8_t d;
+
+    RCC_APB1ENR |= b->apb1en;
+
+    /* 引脚必须先回到 AF 开漏再做任何写: 总线复位会临时把 PB6/PB7 变通用 GPIO,
+       不切回来 I2C 就驱动不了引脚, 表现为从机永远 NAK、屏再也不动。 */
+    if (b == &bus1) {
+        GPIOB_ODR |=  (0x03U << 6);
+        GPIOB_CRL &= ~(0xFFU << 24);  GPIOB_CRL |= (0xFFU << 24);   /* PB6/PB7 AF OD */
+    } else {
+        GPIOB_ODR |=  (0x03U << 10);
+        GPIOB_CRH &= ~(0xFFU << 8);   GPIOB_CRH |= (0xFFU << 8);    /* PB10/PB11 AF OD */
+    }
+
+    *b->CR1 = 0U;                /* PE=0 */
+    *b->CR1 = (1U << 15);        /* SWRST: 清内部状态(含 BUSY 误判) */
+    for (d = 0U; d < 20U; d++) { }
+    *b->CR1 = 0U;                /* 退出 SWRST, 再写配置 */
+    {
+        /* 按实际 APB1 频率现算: 72MHz 主频下 APB1=36MHz, CCR 必须同步放大 9 倍,
+           否则 SCL 会被拉到 450kHz, 屏立刻丢 ACK。I2C1 仍维持 50kHz。 */
+        uint32_t pclk1  = g_pclk1_khz * 1000U;
+        uint32_t target = (b == &bus1) ? 50000U : 100000U;
+        *b->CR2   = (uint16_t)(g_pclk1_khz / 1000U);
+        *b->CCR   = (uint16_t)(pclk1 / (2U * target));
+        *b->TRISE = (uint16_t)(g_pclk1_khz / 1000U + 1U);
+    }
+    for (d = 0U; d < 20U; d++) { }
+    *b->CR1 = (1U << 0);         /* PE */
+}
+
+static uint8_t i2c_write(i2c_bus_t *b, uint8_t addr, const uint8_t *buf, uint16_t n)
+{
+    uint32_t guard;
+    uint16_t i;
+
+    *b->CR1 |= (1U << 8);
+    guard = 0U;
+    while ((*b->SR1 & (1U << 0)) == 0U) {
+        if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 1U; }
+    }
+    *b->DR = addr;
+    guard = 0U;
+    while ((*b->SR1 & (1U << 1)) == 0U) {
+        if (*b->SR1 & (1U << 10)) { *b->SR1 &= ~(1U << 10); *b->CR1 |= (1U << 9); return 2U; }
+        if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 2U; }
+    }
+    (void)*b->SR1; (void)*b->SR2;
+
+    for (i = 0U; i < n; i++) {
+        guard = 0U;
+        while ((*b->SR1 & (1U << 7)) == 0U) {
+            if (*b->SR1 & (1U << 10)) { *b->SR1 &= ~(1U << 10); *b->CR1 |= (1U << 9); return 3U; }
+            if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 3U; }
+        }
+        *b->DR = buf[i];
+    }
+    guard = 0U;
+    while ((*b->SR1 & (1U << 2)) == 0U) {
+        if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 3U; }
+    }
+    *b->CR1 |= (1U << 9);
+    guard = 0U;
+    while (*b->SR2 & (1U << 1)) { if (++guard > b->guard_max) break; }
+    return 0U;
+}
+
+static uint8_t i2c_read(i2c_bus_t *b, uint8_t addr, uint8_t reg, uint8_t *buf, uint16_t n)
+{
+    uint32_t guard;
+    uint16_t i;
+
+    if (n == 0U) return 4U;
+
+    *b->CR1 |= (1U << 8);
+    guard = 0U;
+    while ((*b->SR1 & (1U << 0)) == 0U) {
+        if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 1U; }
+    }
+    *b->DR = addr;
+    guard = 0U;
+    while ((*b->SR1 & (1U << 1)) == 0U) {
+        if (*b->SR1 & (1U << 10)) { *b->SR1 &= ~(1U << 10); *b->CR1 |= (1U << 9); return 2U; }
+        if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 2U; }
+    }
+    (void)*b->SR1; (void)*b->SR2;
+
+    guard = 0U;
+    while ((*b->SR1 & (1U << 7)) == 0U) { if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 3U; } }
+    *b->DR = reg;
+    guard = 0U;
+    while ((*b->SR1 & (1U << 7)) == 0U) { if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 3U; } }
+
+    *b->CR1 |= (1U << 8);
+    guard = 0U;
+    while ((*b->SR1 & (1U << 0)) == 0U) { if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 1U; } }
+
+    *b->DR = addr | 0x01U;
+    guard = 0U;
+    while ((*b->SR1 & (1U << 1)) == 0U) {
+        if (*b->SR1 & (1U << 10)) { *b->SR1 &= ~(1U << 10); *b->CR1 |= (1U << 9); return 2U; }
+        if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 2U; }
+    }
+    (void)*b->SR1; (void)*b->SR2;
+
+    if (n == 1U) *b->CR1 &= ~(1U << 10);
+    else         *b->CR1 |=  (1U << 10);
+
+    for (i = 0U; i < n; i++) {
+        if (i + 2U == n) *b->CR1 &= ~(1U << 10);
+        guard = 0U;
+        while ((*b->SR1 & (1U << 6)) == 0U) { if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 3U; } }
+        if (i + 1U == n) *b->CR1 |= (1U << 9);
+        buf[i] = (uint8_t)*b->DR;
+    }
+    guard = 0U;
+    while (*b->SR2 & (1U << 1)) { if (++guard > b->guard_max) break; }
+    *b->CR1 |= (1U << 10);
+    return 0U;
+}
+
+static uint8_t i2c_wreg(i2c_bus_t *b, uint8_t addr, uint8_t reg, uint8_t val)
+{
+    uint8_t d[2];
+    d[0] = reg; d[1] = val;
+    return i2c_write(b, addr, d, 2U);
+}
+
+static uint8_t i2c_rreg(i2c_bus_t *b, uint8_t addr, uint8_t reg, uint8_t *val)
+{
+    return i2c_read(b, addr, reg, val, 1U);
+}
+
+static uint8_t i2c_ping(i2c_bus_t *b, uint8_t addr)
+{
+    uint8_t d = 0U;
+    return i2c_write(b, addr, &d, 1U);
+}
+
+/* 扫描 I2C 总线, 把应答的 7 位地址写入 found[], 返回个数 */
+static uint8_t i2c_scan(i2c_bus_t *b, uint8_t *found, uint8_t max)
+{
+    /* 只扫常见 I2C 设备地址, 避免 112 个地址全扫的累计耗时 */
+    static const uint8_t addrs[] = {
+        0x3C, 0x3D,   /* OLED */
+        0x57,         /* MAX30102 / MAX30100 */
+        0x68, 0x69,   /* MPU6050 / MPU9250 */
+        0x1E,         /* HMC5883 */
+        0x40,         /* INA219 / Si7021 */
+        0x76, 0x77    /* BMP280 / BME280 */
+    };
+    uint8_t i;
+    uint8_t n = 0U;
+    uint32_t saved = b->guard_max;
+
+    b->guard_max = 2000U;        /* 9 个地址, 单次上限约 2ms */
+
+    for (i = 0U; i < (uint8_t)sizeof(addrs); i++) {
+        if (i2c_ping(b, (uint8_t)(addrs[i] << 1)) == 0U) {
+            if (n < max) found[n] = addrs[i];
+            if (n < 255U) n++;
+        }
+    }
+
+    b->guard_max = saved;
+    return n;
+}
+
+/* I2C2 总线健康诊断: 发 START 后读 SR1/SR2
+   SR1.bit0(SB)=1 说明 START 成功; SR2.bit1(BUSY) 应短暂为 1 */
+static uint8_t d_sr1, d_sr2;
+
+static void i2c2_diag(void)
+{
+    uint32_t guard;
+
+    d_sr1 = (uint8_t)I2C2_SR1;
+    d_sr2 = (uint8_t)I2C2_SR2;
+
+    /* 尝试发 START */
+    I2C2_CR1 |= (1U << 8);
+    guard = 0U;
+    while ((I2C2_SR1 & (1U << 0)) == 0U) {
+        if (++guard > 3000U) break;
+    }
+    d_sr1 = (uint8_t)I2C2_SR1;
+    d_sr2 = (uint8_t)I2C2_SR2;
+    I2C2_CR1 |= (1U << 9);          /* STOP */
+    delay_ms(2U);
+}
+
+/* 用下拉方式读 PB10/PB11, 判断模块侧的 I2C 上拉是否存在。
+   返回 bit0=PB10, bit1=PB11; 读到 1 表示外部有上拉(线通且模块有电) */
+static uint8_t probe_i2c2_pull(void)
+{
+    uint8_t v;
+
+    /* 切成下拉输入: CNF=10 MODE=00 -> 0x8, ODR=0 选下拉 */
+    GPIOB_CRH &= ~(0xFFU << 8);
+    GPIOB_CRH |=  (0x88U << 8);
+    GPIOB_ODR &= ~((1U << 10) | (1U << 11));
+    delay_ms(30U);
+
+    v = (uint8_t)((GPIOB_IDR >> 10) & 0x03U);
+
+    /* 恢复复用开漏 50MHz */
+    GPIOB_CRH &= ~(0xFFU << 8);
+    GPIOB_CRH |=  (0xFFU << 8);
+    delay_ms(5U);
+
+    /* 关键: 引脚方向被改过, I2C2 状态机可能卡在 BUSY, 必须复位控制器 */
+    I2C2_CR1 &= ~(1U << 0);      /* 关 PE, 清所有内部状态 */
+    delay_ms(10U);
+    I2C2_CR1 |=  (1U << 0);      /* 重新使能, CR2/CCR/TRISE 保持不变 */
+    delay_ms(10U);
+
+    return v;
+}
+
+/* 扫描结果缓存 */
+static uint8_t bus1_found[8];
+static uint8_t bus1_found_n;
+static uint8_t bus2_found[8];
+static uint8_t bus2_found_n;
+static uint8_t i2c2_pull;
+
+/* ==================== OLED ==================== */
+static uint8_t oled_buf[8][128];
+static uint8_t oled_present;
+volatile uint32_t dbg_flush;   /* [31:16]=整帧刷屏成功次数 [15:0]=中途失败次数 */
+volatile uint32_t dbg_ping1;   /* 每秒一次 OLED 地址(0x78) ping 返回码 */
+volatile uint32_t dbg_smp;     /* 累计采样数, 用于核对真实采样速率 */
+
+static uint8_t page_idx;
+static uint8_t measure_on = 1U;
+
+static const uint8_t oled_init_seq[] = {
+    0x00,
+    0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40,
+    0xA0, 0xC0, 0xDA, 0x12, 0x81, 0xCF, 0xD9, 0xF1,
+    0xDB, 0x30, 0xA4, 0xA6, 0x8D, 0x14, 0xAF
+};
+
+static const uint8_t F8x16[95][16] = {
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0xF8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x33,0x30,0x00,0x00,0x00,
+    0x00,0x16,0x0E,0x00,0x16,0x0E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x40,0xC0,0x78,0x40,0xC0,0x78,0x40,0x00,0x04,0x3F,0x04,0x04,0x3F,0x04,0x04,0x00,
+    0x00,0x70,0x88,0xFC,0x08,0x30,0x00,0x00,0x00,0x18,0x20,0xFF,0x21,0x1E,0x00,0x00,
+    0xF0,0x08,0xF0,0x00,0xE0,0x18,0x00,0x00,0x00,0x21,0x1C,0x03,0x1E,0x21,0x1E,0x00,
+    0x00,0xF0,0x08,0x88,0x70,0x00,0x00,0x00,0x1E,0x21,0x23,0x24,0x19,0x27,0x21,0x10,
+    0x00,0x00,0x00,0x16,0x0E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0xE0,0x18,0x04,0x02,0x00,0x00,0x00,0x00,0x07,0x18,0x20,0x40,0x00,
+    0x00,0x02,0x04,0x18,0xE0,0x00,0x00,0x00,0x00,0x40,0x20,0x18,0x07,0x00,0x00,0x00,
+    0x40,0x40,0x80,0xF0,0x80,0x40,0x40,0x00,0x02,0x02,0x01,0x0F,0x01,0x02,0x02,0x00,
+    0x00,0x00,0x00,0xF0,0x00,0x00,0x00,0x00,0x01,0x01,0x01,0x1F,0x01,0x01,0x01,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xB0,0x70,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x01,0x01,0x01,0x01,0x01,0x01,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x30,0x30,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x80,0x60,0x18,0x04,0x00,0x60,0x18,0x06,0x01,0x00,0x00,0x00,
+    0x00,0xE0,0x10,0x08,0x08,0x10,0xE0,0x00,0x00,0x0F,0x10,0x20,0x20,0x10,0x0F,0x00,
+    0x00,0x10,0x10,0xF8,0x00,0x00,0x00,0x00,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x00,0x70,0x08,0x08,0x08,0x88,0x70,0x00,0x00,0x30,0x28,0x24,0x22,0x21,0x30,0x00,
+    0x00,0x30,0x08,0x88,0x88,0x48,0x30,0x00,0x00,0x18,0x20,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0x00,0xC0,0x20,0x10,0xF8,0x00,0x00,0x00,0x07,0x04,0x24,0x24,0x3F,0x24,0x00,
+    0x00,0xF8,0x08,0x88,0x88,0x08,0x08,0x00,0x00,0x19,0x21,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0xE0,0x10,0x88,0x88,0x18,0x00,0x00,0x00,0x0F,0x11,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0x38,0x08,0x08,0xC8,0x38,0x08,0x00,0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00,
+    0x00,0x70,0x88,0x08,0x08,0x88,0x70,0x00,0x00,0x1C,0x22,0x21,0x21,0x22,0x1C,0x00,
+    0x00,0xE0,0x10,0x08,0x08,0x10,0xE0,0x00,0x00,0x00,0x31,0x22,0x22,0x11,0x0F,0x00,
+    0x00,0x00,0x00,0xC0,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x30,0x30,0x00,0x00,0x00,
+    0x00,0x00,0x00,0xC0,0xC0,0x00,0x00,0x00,0x00,0x00,0x80,0xB0,0x70,0x00,0x00,0x00,
+    0x00,0x00,0x80,0x40,0x20,0x10,0x08,0x00,0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x00,
+    0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x00,0x04,0x04,0x04,0x04,0x04,0x04,0x04,0x00,
+    0x00,0x08,0x10,0x20,0x40,0x80,0x00,0x00,0x00,0x20,0x10,0x08,0x04,0x02,0x01,0x00,
+    0x00,0x70,0x48,0x08,0x08,0x08,0xF0,0x00,0x00,0x00,0x00,0x30,0x36,0x01,0x00,0x00,
+    0xC0,0x30,0xC8,0x28,0xE8,0x10,0xE0,0x00,0x07,0x18,0x27,0x24,0x23,0x14,0x0B,0x00,
+    0x00,0x00,0xC0,0x38,0xE0,0x00,0x00,0x00,0x20,0x3C,0x23,0x02,0x02,0x27,0x38,0x20,
+    0x08,0xF8,0x88,0x88,0x88,0x70,0x00,0x00,0x20,0x3F,0x20,0x20,0x20,0x11,0x0E,0x00,
+    0xC0,0x30,0x08,0x08,0x08,0x08,0x38,0x00,0x07,0x18,0x20,0x20,0x20,0x10,0x08,0x00,
+    0x08,0xF8,0x08,0x08,0x08,0x10,0xE0,0x00,0x20,0x3F,0x20,0x20,0x20,0x10,0x0F,0x00,
+    0x08,0xF8,0x88,0x88,0xE8,0x08,0x10,0x00,0x20,0x3F,0x20,0x20,0x23,0x20,0x18,0x00,
+    0x08,0xF8,0x88,0x88,0xE8,0x08,0x10,0x00,0x20,0x3F,0x20,0x00,0x03,0x00,0x00,0x00,
+    0xC0,0x30,0x08,0x08,0x08,0x38,0x00,0x00,0x07,0x18,0x20,0x20,0x22,0x1E,0x02,0x00,
+    0x08,0xF8,0x08,0x00,0x00,0x08,0xF8,0x08,0x20,0x3F,0x21,0x01,0x01,0x21,0x3F,0x20,
+    0x00,0x08,0x08,0xF8,0x08,0x08,0x00,0x00,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x00,0x00,0x08,0x08,0xF8,0x08,0x08,0x00,0xC0,0x80,0x80,0x80,0x7F,0x00,0x00,0x00,
+    0x08,0xF8,0x88,0xC0,0x28,0x18,0x08,0x00,0x20,0x3F,0x20,0x01,0x26,0x38,0x20,0x00,
+    0x08,0xF8,0x08,0x00,0x00,0x00,0x00,0x00,0x20,0x3F,0x20,0x20,0x20,0x20,0x30,0x00,
+    0x08,0xF8,0xF8,0x00,0xF8,0xF8,0x08,0x00,0x20,0x3F,0x00,0x3F,0x00,0x3F,0x20,0x00,
+    0x08,0xF8,0x30,0xC0,0x00,0x08,0xF8,0x08,0x20,0x3F,0x20,0x00,0x07,0x18,0x3F,0x00,
+    0xE0,0x10,0x08,0x08,0x08,0x10,0xE0,0x00,0x0F,0x10,0x20,0x20,0x20,0x10,0x0F,0x00,
+    0x08,0xF8,0x08,0x08,0x08,0x08,0xF0,0x00,0x20,0x3F,0x21,0x01,0x01,0x01,0x00,0x00,
+    0xE0,0x10,0x08,0x08,0x08,0x10,0xE0,0x00,0x0F,0x18,0x24,0x24,0x38,0x50,0x4F,0x00,
+    0x08,0xF8,0x88,0x88,0x88,0x88,0x70,0x00,0x20,0x3F,0x20,0x00,0x03,0x0C,0x30,0x20,
+    0x00,0x70,0x88,0x08,0x08,0x08,0x38,0x00,0x00,0x38,0x20,0x21,0x21,0x22,0x1C,0x00,
+    0x18,0x08,0x08,0xF8,0x08,0x08,0x18,0x00,0x00,0x00,0x20,0x3F,0x20,0x00,0x00,0x00,
+    0x08,0xF8,0x08,0x00,0x00,0x08,0xF8,0x08,0x00,0x1F,0x20,0x20,0x20,0x20,0x1F,0x00,
+    0x08,0x78,0x88,0x00,0x00,0xC8,0x38,0x08,0x00,0x00,0x07,0x38,0x0E,0x01,0x00,0x00,
+    0xF8,0x08,0x00,0xF8,0x00,0x08,0xF8,0x00,0x03,0x3C,0x07,0x00,0x07,0x3C,0x03,0x00,
+    0x08,0x18,0x68,0x80,0x80,0x68,0x18,0x08,0x20,0x30,0x2C,0x03,0x03,0x2C,0x30,0x20,
+    0x08,0x38,0xC8,0x00,0xC8,0x38,0x08,0x00,0x00,0x00,0x20,0x3F,0x20,0x00,0x00,0x00,
+    0x10,0x08,0x08,0x08,0xC8,0x38,0x08,0x00,0x20,0x38,0x26,0x21,0x20,0x20,0x18,0x00,
+    0x00,0x00,0x00,0xFE,0x02,0x02,0x02,0x00,0x00,0x00,0x00,0x7F,0x40,0x40,0x40,0x00,
+    0x00,0x0C,0x30,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x06,0x38,0xC0,0x00,
+    0x00,0x02,0x02,0x02,0xFE,0x00,0x00,0x00,0x00,0x40,0x40,0x40,0x7F,0x00,0x00,0x00,
+    0x00,0x20,0x10,0x08,0x04,0x08,0x10,0x20,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,
+    0x00,0x02,0x04,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x00,0x00,0x00,0x19,0x24,0x22,0x22,0x22,0x3F,0x20,
+    0x08,0xF8,0x00,0x80,0x80,0x00,0x00,0x00,0x00,0x3F,0x11,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0x00,0x00,0x80,0x80,0x80,0x00,0x00,0x00,0x0E,0x11,0x20,0x20,0x20,0x11,0x00,
+    0x00,0x00,0x00,0x80,0x80,0x88,0xF8,0x00,0x00,0x0E,0x11,0x20,0x20,0x10,0x3F,0x20,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x00,0x00,0x00,0x1F,0x22,0x22,0x22,0x22,0x13,0x00,
+    0x00,0x80,0x80,0xF0,0x88,0x88,0x88,0x18,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x80,0x00,0x00,0x6B,0x94,0x94,0x94,0x93,0x60,0x00,
+    0x08,0xF8,0x00,0x80,0x80,0x80,0x00,0x00,0x20,0x3F,0x21,0x00,0x00,0x20,0x3F,0x20,
+    0x00,0x80,0x98,0x98,0x00,0x00,0x00,0x00,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x00,0x00,0x00,0x80,0x98,0x98,0x00,0x00,0x00,0xC0,0x80,0x80,0x80,0x7F,0x00,0x00,
+    0x08,0xF8,0x00,0x00,0x80,0x80,0x80,0x00,0x20,0x3F,0x24,0x02,0x2D,0x30,0x20,0x00,
+    0x00,0x08,0x08,0xF8,0x00,0x00,0x00,0x00,0x00,0x20,0x20,0x3F,0x20,0x20,0x00,0x00,
+    0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x00,0x20,0x3F,0x20,0x00,0x3F,0x20,0x00,0x3F,
+    0x00,0x80,0x80,0x00,0x80,0x80,0x00,0x00,0x00,0x20,0x3F,0x21,0x00,0x20,0x3F,0x20,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x00,0x00,0x00,0x1F,0x20,0x20,0x20,0x20,0x1F,0x00,
+    0x80,0x80,0x00,0x80,0x80,0x00,0x00,0x00,0x80,0xFF,0xA1,0x20,0x20,0x11,0x0E,0x00,
+    0x00,0x00,0x00,0x80,0x80,0x80,0x80,0x00,0x00,0x0E,0x11,0x20,0x20,0xA0,0xFF,0x80,
+    0x80,0x80,0x80,0x00,0x80,0x80,0x80,0x00,0x20,0x20,0x3F,0x21,0x20,0x00,0x01,0x00,
+    0x00,0x00,0x80,0x80,0x80,0x80,0x80,0x00,0x00,0x33,0x24,0x24,0x24,0x24,0x19,0x00,
+    0x00,0x80,0x80,0xE0,0x80,0x80,0x00,0x00,0x00,0x00,0x00,0x1F,0x20,0x20,0x00,0x00,
+    0x80,0x80,0x00,0x00,0x00,0x80,0x80,0x00,0x00,0x1F,0x20,0x20,0x20,0x10,0x3F,0x20,
+    0x80,0x80,0x80,0x00,0x00,0x80,0x80,0x80,0x00,0x01,0x0E,0x30,0x08,0x06,0x01,0x00,
+    0x80,0x80,0x00,0x80,0x00,0x80,0x80,0x80,0x0F,0x30,0x0C,0x03,0x0C,0x30,0x0F,0x00,
+    0x00,0x80,0x80,0x00,0x80,0x80,0x80,0x00,0x00,0x20,0x31,0x2E,0x0E,0x31,0x20,0x00,
+    0x80,0x80,0x80,0x00,0x00,0x80,0x80,0x80,0x80,0x81,0x8E,0x70,0x18,0x06,0x01,0x00,
+    0x00,0x80,0x80,0x80,0x80,0x80,0x80,0x00,0x00,0x21,0x30,0x2C,0x22,0x21,0x30,0x00,
+    0x00,0x00,0x00,0x00,0x80,0x7C,0x02,0x02,0x00,0x00,0x00,0x00,0x00,0x3F,0x40,0x40,
+    0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x00,
+    0x00,0x02,0x02,0x7C,0x80,0x00,0x00,0x00,0x00,0x40,0x40,0x3F,0x00,0x00,0x00,0x00,
+    0x00,0x80,0x40,0x40,0x80,0x00,0x00,0x80,0x00,0x00,0x00,0x00,0x00,0x01,0x01,0x00
+};
+
+static void i2c1_bus_recover(void);   /* 前置声明: 刷屏失败时也要能复位总线 */
+
+/* 分页非阻塞刷屏: 一次主循环只写一页(133B@50kHz≈24ms), 8 页用 8 圈主循环写完。
+   整帧阻塞 190ms 会让 100Hz 采样在那段时间里欠读, 只能靠"多读"补, 结果读到重复样本,
+   Maxim 算法的采样时基被拉歪(实测采样 128/s 而不是 100/s)。拆成页级状态机后时基就准了。 */
+static uint8_t flush_page;
+static uint8_t flush_busy;
+
+static void oled_flush_begin(void)
+{
+    flush_page = 0U;
+    flush_busy = oled_present ? 1U : 0U;
+}
+
+static void oled_flush_step(void)
+{
+    uint8_t d[133];
+    uint8_t c[4];
+    uint8_t page, i, try_n;
+    uint8_t rc = 1U;
+
+    if (!flush_busy) return;
+    if (!oled_present) { flush_busy = 0U; return; }
+
+    page = flush_page;
+    for (try_n = 0U; try_n < 3U && rc != 0U; try_n++) {
+        c[0] = 0x00U;
+        c[1] = (uint8_t)(0xB0U | page);
+        c[2] = 0x02U;
+        c[3] = 0x10U;
+        rc = i2c_write(&bus1, OLED_ADDR, c, 4U);
+        if (rc != 0U) continue;
+        d[0] = 0x40U;
+        for (i = 0U; i < 132U; i++)
+            d[1U + i] = (i < 128U) ? oled_buf[page][i] : 0x00U;
+        rc = i2c_write(&bus1, OLED_ADDR, d, 133U);
+    }
+    if (rc != 0U) {                            /* 连续三次失败: 复位总线, 本页跳过 */
+        i2c1_bus_recover();
+        dbg_flush = ((dbg_flush >> 16) << 16) | ((dbg_flush & 0xFFFFU) + 1U);
+        c[0] = 0x00U; c[1] = (uint8_t)(0xB0U | page); c[2] = 0x02U; c[3] = 0x10U;
+        (void)i2c_write(&bus1, OLED_ADDR, c, 4U);
+    }
+
+    flush_page++;
+    if (flush_page >= 8U) {                    /* 一帧写完 */
+        flush_page = 0U;
+        flush_busy = 0U;
+        dbg_flush = (((dbg_flush >> 16) + 1U) << 16) | (dbg_flush & 0xFFFFU);
+    }
+}
+
+/* 上电自检页用: 连续把 8 页发完(阻塞版, 启动阶段无所谓实时性) */
+static void oled_flush_blocking(void)
+{
+    uint8_t k;
+    oled_flush_begin();
+    for (k = 0U; k < 8U && flush_busy; k++) oled_flush_step();
+}
+
+static void oled_clear(void)
+{
+    uint8_t p, x;
+    for (p = 0U; p < 8U; p++)
+        for (x = 0U; x < 128U; x++)
+            oled_buf[p][x] = 0U;
+}
+
+/* 8x16 字符: 占 page 与 page+1 两页 */
+static void draw_char(uint16_t x, uint8_t page, char c)
+{
+    uint8_t i, idx;
+    if (c < 0x20 || c > 0x7E) c = '?';
+    idx = (uint8_t)(c - 0x20);
+    for (i = 0U; i < 8U; i++) {
+        if (x + i > 127U) break;
+        oled_buf[page][x + i] = F8x16[idx][i];
+        if (page + 1U < 8U)
+            oled_buf[page + 1U][x + i] = F8x16[idx][8U + i];
+    }
+}
+
+static void draw_str(uint16_t x, uint8_t page, const char *s)
+{
+    while (*s) {
+        if (x > 119U) break;
+        draw_char(x, page, *s);
+        x += 8U;
+        s++;
+    }
+}
+
+/* ==================== MPU6050 ==================== */
+static uint8_t mpu_present;
+static int16_t acc_x, acc_y, acc_z;
+
+#define MPU_PWR_MGMT_1   0x6BU
+#define MPU_SMPLRT_DIV   0x19U
+#define MPU_CONFIG       0x1AU
+#define MPU_GYRO_CONFIG  0x1BU
+#define MPU_ACCEL_CONFIG 0x1CU
+#define MPU_ACCEL_XOUT_H 0x3BU
+#define MPU_WHO_AM_I     0x75U
+
+static uint8_t mpu_init(void)
+{
+    uint8_t v;
+    if (i2c_rreg(&bus1, MPU_ADDR, MPU_WHO_AM_I, &v) != 0U) return 1U;
+    if (v != 0x68U) return 2U;
+
+    i2c_wreg(&bus1, MPU_ADDR, MPU_PWR_MGMT_1, 0x80U);
+    delay_ms(100U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_PWR_MGMT_1, 0x00U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_SMPLRT_DIV, 0x09U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_CONFIG, 0x03U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_GYRO_CONFIG, 0x00U);
+    i2c_wreg(&bus1, MPU_ADDR, MPU_ACCEL_CONFIG, 0x00U);
+    return 0U;
+}
+
+static uint8_t mpu_read(void)
+{
+    uint8_t b[14];
+    if (i2c_read(&bus1, MPU_ADDR, MPU_ACCEL_XOUT_H, b, 14U) != 0U) return 1U;
+    acc_x = (int16_t)((b[0] << 8) | b[1]);
+    acc_y = (int16_t)((b[2] << 8) | b[3]);
+    acc_z = (int16_t)((b[4] << 8) | b[5]);
+    return 0U;
+}
+
+/* ==================== MAX30102 ==================== */
+static uint8_t max_present;
+static uint8_t max_bus_no;              /* 0=未找到 1=硬件I2C2(PB10/PB11) 2=I2C1(兜底) */
+volatile uint32_t dbg_rep;              /* 供 ST-Link 直接读的诊断字 */
+volatile uint32_t dbg_tx;               /* 已发出的波形帧数(诊断串口是否真的在发) */
+volatile uint32_t dbg_rc;               /* [7:0]=硬件I2C2 ping码 [15:8]=软I2C ping码 [23:16]=软I2C读ID码 */
+volatile uint32_t dbg_lv;               /* [23:16]=拉低自检 [15:8]=内部上拉时的 PB11/PB10, [7:0]=浮空时的 */
+volatile uint32_t dbg_cnt;              /* 主循环心跳计数 */
+volatile uint32_t dbg_oled;             /* OLED 初始化尝试次数(0=尚未尝试) */
+volatile uint32_t dbg_map[4];           /* 硬件 I2C2 全地址扫描位图 */
+volatile uint32_t dbg_scan;             /* 扫描到的设备个数 */
+volatile uint32_t dbg_regs[4];          /* MAX 配置回读 / FIFO 指针 / 温度 / FIFO 原始数据 */
+volatile uint32_t dbg_edge[128];        /* PA3 边沿间隔(周期数), 用于反推模块 TX 波特率 */
+static uint8_t max_ord, max_speed;      /* 命中的线序(1/2) 与速率档(1/2) */
+static uint8_t max_part_id, max_rev_id;
+static uint8_t max_ack1, max_ack2;      /* 0 = 地址 0x57 有应答 */
+static uint8_t max_id1,  max_id2;
+static uint32_t max_ir_raw, max_red_raw;
+static uint32_t red_buf[100];
+static uint32_t ir_buf[100];
+static uint8_t buf_idx;
+
+/* Maxim 官方算法 4 秒数据窗口(100Hz -> 400 样本), 由 max_read_fifo 顺序填充 */
+#define BUFFER_SIZE  400
+#define MA4_SIZE     4
+#define HAMMING_SIZE 5
+static uint32_t pbuf_ir[BUFFER_SIZE];
+static uint32_t pbuf_red[BUFFER_SIZE];
+static uint16_t pbuf_cnt;
+
+/* 波形帧缓存: 攒够 2 个 IR 采样发一帧 (50Hz) */
+static uint32_t wave_ir[2];
+static uint32_t wave_red[2];
+static uint8_t  wave_cnt;
+
+#define MAX_FIFO_WR_PTR  0x04U
+#define MAX_OVF_COUNTER  0x05U
+#define MAX_FIFO_RD_PTR  0x06U
+#define MAX_FIFO_DATA    0x07U
+#define MAX_FIFO_CONFIG  0x08U
+#define MAX_MODE_CONFIG  0x09U
+#define MAX_SPO2_CONFIG  0x0AU
+#define MAX_LED1_PA      0x0CU
+#define MAX_LED2_PA      0x0DU
+#define MAX_PART_ID      0xFFU
+
+/* ---------- 软件 I2C: 默认 PB10=SCL / PB11=SDA, 可整体换序换速 ---------- */
+static uint8_t  si_scl = 10U;
+static uint8_t  si_sda = 11U;
+static volatile uint16_t si_dly_cnt = 20U;
+
+static void si_dly(void)
+{
+    volatile uint16_t i;
+    for (i = 0U; i < si_dly_cnt; i++) { }
+}
+
+static void pb_pin(uint8_t pin, uint8_t low)
+{
+    uint32_t sh = (uint32_t)((pin - 8U) * 4U);      /* PB10->位8  PB11->位12 */
+    if (low) {
+        GPIOB_ODR &= ~(1U << pin);                  /* 输出低 */
+        GPIOB_CRH = (GPIOB_CRH & ~(0xFU << sh)) | ((uint32_t)0x6U << sh);  /* 开漏输出 */
+    } else {
+        GPIOB_ODR |=  (1U << pin);                  /* 释放 + 上拉 */
+        GPIOB_CRH = (GPIOB_CRH & ~(0xFU << sh)) | ((uint32_t)0x8U << sh);  /* 上拉输入 */
+    }
+}
+
+/* 9 个时钟把可能卡住总线的从机放开 */
+static void si_bus_recover(void)
+{
+    uint8_t i;
+    pb_pin(si_sda, 0U); pb_pin(si_scl, 0U); si_dly();
+    for (i = 0U; i < 9U; i++) {
+        pb_pin(si_scl, 1U); si_dly();
+        pb_pin(si_scl, 0U); si_dly();
+    }
+    pb_pin(si_sda, 1U); pb_pin(si_scl, 1U); si_dly();
+    pb_pin(si_scl, 0U); si_dly();
+    pb_pin(si_sda, 0U); si_dly();
+}
+
+static void si_start(void)
+{
+    pb_pin(si_sda, 1U); pb_pin(si_scl, 1U); si_dly();   /* 都放开为高 */
+    pb_pin(si_sda, 0U); si_dly();                       /* SCL 高时 SDA 下降 = START */
+    pb_pin(si_scl, 0U); si_dly();
+}
+
+static void si_stop(void)
+{
+    pb_pin(si_sda, 0U); pb_pin(si_scl, 0U); si_dly();
+    pb_pin(si_scl, 1U); si_dly();                       /* 先放 SCL */
+    pb_pin(si_sda, 1U); si_dly();                       /* SCL 高时 SDA 上升 = STOP */
+}
+
+static void si_wbit(uint8_t b)
+{
+    pb_pin(si_sda, (uint8_t)(b ? 0U : 1U));
+    si_dly();
+    pb_pin(si_scl, 1U); si_dly();
+    pb_pin(si_scl, 0U); si_dly();
+}
+
+static uint8_t si_rbit(void)
+{
+    uint8_t v;
+    pb_pin(si_sda, 1U); si_dly();                       /* 释放 SDA 交给从机 */
+    pb_pin(si_scl, 1U); si_dly();                       /* 高电平期间数据有效 */
+    v = (uint8_t)((GPIOB_IDR >> si_sda) & 1U);
+    pb_pin(si_scl, 0U); si_dly();
+    return v;
+}
+
+static uint8_t si_wbyte(uint8_t b)
+{
+    uint8_t i, ack;
+    for (i = 0U; i < 8U; i++) si_wbit((uint8_t)((b >> (7U - i)) & 1U));
+    ack = si_rbit();                                /* 0 = 从机 ACK */
+    return ack;
+}
+
+static uint8_t si_rbyte(uint8_t last)
+{
+    uint8_t i, v = 0U;
+    for (i = 0U; i < 8U; i++) v = (uint8_t)((v << 1) | si_rbit());
+    pb_pin(si_sda, (uint8_t)(last ? 1U : 0U));      /* 最后一字节 NACK(高), 否则 ACK(低) */
+    si_dly();
+    pb_pin(si_scl, 1U); si_dly();
+    pb_pin(si_scl, 0U); si_dly();
+    return v;
+}
+
+static uint8_t si_ping(uint8_t a7)
+{
+    uint8_t ack;
+    si_start();
+    ack = si_wbyte((uint8_t)(a7 << 1));
+    si_stop();
+    return ack;
+}
+
+static uint8_t si_wreg(uint8_t a7, uint8_t reg, uint8_t val)
+{
+    uint8_t ack;
+    si_start();
+    ack = si_wbyte((uint8_t)(a7 << 1));
+    if (ack != 0U) { si_stop(); return 1U; }
+    ack = si_wbyte(reg);
+    if (ack != 0U) { si_stop(); return 2U; }
+    ack = si_wbyte(val);
+    si_stop();
+    return (ack != 0U) ? 3U : 0U;
+}
+
+static uint8_t si_rreg(uint8_t a7, uint8_t reg, uint8_t *val)
+{
+    uint8_t ack;
+    si_start();
+    ack = si_wbyte((uint8_t)(a7 << 1));
+    if (ack != 0U) { si_stop(); return 1U; }
+    ack = si_wbyte(reg);
+    if (ack != 0U) { si_stop(); return 2U; }
+    si_start();
+    ack = si_wbyte((uint8_t)((a7 << 1) | 1U));
+    if (ack != 0U) { si_stop(); return 3U; }
+    *val = si_rbyte(1U);
+    si_stop();
+    return 0U;
+}
+
+static uint8_t si_rd_blk(uint8_t a7, uint8_t reg, uint8_t *buf, uint8_t n)
+{
+    uint8_t ack, i;
+    si_start();
+    ack = si_wbyte((uint8_t)(a7 << 1));
+    if (ack != 0U) { si_stop(); return 1U; }
+    ack = si_wbyte(reg);
+    if (ack != 0U) { si_stop(); return 2U; }
+    si_start();
+    ack = si_wbyte((uint8_t)((a7 << 1) | 1U));
+    if (ack != 0U) { si_stop(); return 3U; }
+    for (i = 0U; i < n; i++) buf[i] = si_rbyte((uint8_t)((i + 1U) >= n));
+    si_stop();
+    return 0U;
+}
+
+/* 把 PB10/PB11 从 I2C2 外设手里拿回来, 交给软件时序 */
+static void max_gpio_init(void)
+{
+    I2C2_CR1 &= ~(1U << 0);                  /* 关 I2C2, 释放引脚 */
+    GPIOB_CRH &= ~(0xFFU << 8);
+    GPIOB_CRH |=  (0x88U << 8);              /* PB10/PB11 上拉输入 */
+    GPIOB_ODR |=  (0x03U << 10);
+    delay_ms(2U);
+}
+
+/* MAX30102 访问统一入口: 硬件 I2C2 (PB10=SCL / PB11=SDA) */
+static i2c_bus_t *max_bp = &bus2;
+
+static uint8_t max_rd(uint8_t reg, uint8_t *v)
+{
+    if (max_bus_no == 0U) return 1U;
+    if (max_bus_no >= 11U) return si_rreg(0x57U, reg, v);
+    return i2c_rreg(max_bp, MAX_ADDR, reg, v);
+}
+
+static uint8_t max_wr(uint8_t reg, uint8_t val)
+{
+    if (max_bus_no == 0U) return 1U;
+    if (max_bus_no >= 11U) return si_wreg(0x57U, reg, val);
+    return i2c_wreg(max_bp, MAX_ADDR, reg, val);
+}
+
+static uint8_t max_rd_blk(uint8_t reg, uint8_t *buf, uint8_t n)
+{
+    uint8_t i;
+    if (max_bus_no == 0U) return 1U;
+    if (max_bus_no >= 11U) {                    /* 软 I2C 逐字节读 */
+        if (si_rreg(0x57U, reg, buf) != 0U) return 1U;
+        for (i = 1U; i < n; i++) {
+            if (si_rreg(0x57U, (uint8_t)(reg + i), &buf[i]) != 0U) return 1U;
+        }
+        return 0U;
+    }
+    return i2c_read(max_bp, MAX_ADDR, reg, buf, n);
+}
+
+/* PB10/PB11 纯浮空输入读数: 模块在位且供电时, 其板载上拉会把线拉高 */
+static uint8_t pb_float_read(void)
+{
+    uint8_t v;
+    GPIOB_CRH &= ~(0xFFU << 8);
+    GPIOB_CRH |=  (0x44U << 8);             /* 0x4 = 浮空输入 */
+    delay_ms(2U);
+    v = (uint8_t)((GPIOB_IDR >> 10) & 0x03U);
+    GPIOB_CRH &= ~(0xFFU << 8);
+    GPIOB_CRH |=  (0x88U << 8);             /* 恢复上拉输入 */
+    delay_ms(1U);
+    return v;
+}
+
+/* 4 组组合全试: 线序 1/2 × 速率 1/2 */
+static uint8_t max_probe_soft(void)
+{
+    static const uint8_t ord[2][2] = { {10U, 11U}, {11U, 10U} };   /* {SCL, SDA} */
+    static const uint16_t spd[2]  = { 20U, 80U };
+    uint8_t i, s, v;
+
+    max_ack1 = 1U;
+    for (s = 0U; s < 2U; s++) {
+        for (i = 0U; i < 2U; i++) {
+            si_scl = ord[i][0];
+            si_sda = ord[i][1];
+            si_dly_cnt = spd[s];
+            max_gpio_init();
+            si_bus_recover();
+            if (si_ping(MAX_ADDR) != 0U) continue;
+            max_ack1 = 0U;
+            if (si_rreg(MAX_ADDR, MAX_PART_ID, &v) != 0U) continue;
+            max_id1   = v;
+            max_ord   = (uint8_t)(i + 1U);
+            max_speed = (uint8_t)(s + 1U);
+            if (v == 0x15U) { max_bus_no = 1U; max_part_id = v; return 0U; }
+        }
+    }
+    return 1U;
+}
+
+static uint8_t max_init(void)
+{
+    uint8_t v = 0U, fl, pu, drv;
+
+    max_bus_no = 0U;
+    max_part_id = 0U;
+    max_rev_id  = 0U;
+    max_ack1 = 1U; max_ack2 = 1U;
+    max_id1  = 0U; max_id2  = 0U;
+    max_ord  = 0U; max_speed = 0U;
+
+    /* 先测 PB10/PB11 的线电平: 浮空(看外部上拉) 与 内部上拉 两种 */
+    GPIOB_CRH &= ~(0xFFU << 8); GPIOB_CRH |= (0x44U << 8);
+    delay_ms(3U);
+    fl = (uint8_t)((GPIOB_IDR >> 10) & 0x03U);
+
+    /* 驱动能力自检: 两脚开漏拉低, 读回应为 00 */
+    GPIOB_CRH &= ~(0xFFU << 8); GPIOB_CRH |= (0x66U << 8);
+    GPIOB_ODR &= ~(0x03U << 10);
+    delay_ms(3U);
+    drv = (uint8_t)((GPIOB_IDR >> 10) & 0x03U);
+    GPIOB_ODR |= (0x03U << 10);
+
+    GPIOB_CRH &= ~(0xFFU << 8); GPIOB_CRH |= (0x88U << 8);
+    delay_ms(3U);
+    pu = (uint8_t)((GPIOB_IDR >> 10) & 0x03U);
+    dbg_lv = ((uint32_t)drv << 16) | ((uint32_t)pu << 8) | (uint32_t)fl;
+
+    /* 1) 硬件 I2C2: PB10=SCL, PB11=SDA —— 与 v3 板 J5 针脚完全一致 */
+    GPIOB_CRH &= ~(0xFFU << 8);
+    GPIOB_CRH |=  (0xFFU << 8);              /* AF 开漏 */
+    GPIOB_ODR |=  (0x03U << 10);
+    i2c_init(&bus2);
+    delay_ms(2U);
+
+    max_ack1 = i2c_ping(&bus2, MAX_ADDR);
+    dbg_rc = (uint32_t)max_ack1;                    /* [7:0] = 硬件 I2C2 ping 返回码 */
+
+    /* 硬件 I2C2 全地址扫描: 仅在探测失败时运行, 看总线上到底有没有设备 */
+    if (max_ack1 != 0U) {
+        uint8_t a;
+        uint32_t save = bus2.guard_max;
+        bus2.guard_max = 3000U;
+        for (a = 0U; a < 128U; a++) {
+            if (i2c_ping(&bus2, (uint8_t)(a << 1)) == 0U) {
+                dbg_map[a >> 5] |= (1U << (a & 31U));
+                dbg_scan++;
+            }
+        }
+        bus2.guard_max = save;
+    }
+    if (max_ack1 == 0U) {
+        max_bus_no = 1U;
+        if (i2c_rreg(&bus2, MAX_ADDR, MAX_PART_ID, &v) == 0U) {
+            max_id1     = v;
+            max_part_id = v;
+        }
+    }
+
+    /* 2) 兜底: 软件 I2C 在 PB10/PB11 上两种线序都试(应对 SCL/SDA 插反) */
+    if (max_bus_no == 0U) {
+        static const uint8_t ord[2][2] = { {10U, 11U}, {11U, 10U} };   /* {SCL, SDA} */
+        uint8_t i, s;
+        for (i = 0U; i < 2U && max_bus_no == 0U; i++) {
+            si_scl = ord[i][0];
+            si_sda = ord[i][1];
+            si_dly_cnt = 12U;
+            I2C2_CR1 &= ~(1U << 0);                  /* 让出引脚 */
+            pb_pin(si_scl, 1U); pb_pin(si_sda, 1U);
+            delay_ms(2U);
+            if (si_ping(0x57U) == 0U) {
+                max_bus_no = (uint8_t)(11U + i);     /* 11/12 = 软 I2C 线序 */
+                max_ack1 = 0U;
+                s = 0U;
+                {
+                    uint8_t rc = si_rreg(0x57U, MAX_PART_ID, &s);
+                    if ((uint8_t)(11U + i) == 11U) dbg_rc |= ((uint32_t)rc << 16);
+                    if (rc == 0U) { max_id1 = s; max_part_id = s; }
+                }
+            } else if ((uint8_t)(11U + i) == 11U) {
+                dbg_rc |= (1U << 8);                 /* 线序1 ping 失败 */
+            }
+        }
+        /* 恢复硬件 I2C2 引脚配置 */
+        GPIOB_CRH &= ~(0xFFU << 8);
+        GPIOB_CRH |=  (0xFFU << 8);
+        i2c_init(&bus2);
+        delay_ms(2U);
+    }
+
+    /* 3) 兜底: 若线误插在 PB6/PB7(OLED 那条总线) 也能认出来 */
+    if (max_bus_no == 0U) {
+        if (i2c_ping(&bus1, MAX_ADDR) == 0U) {
+            max_ack2 = 0U;
+            if (i2c_rreg(&bus1, MAX_ADDR, MAX_PART_ID, &v) == 0U) {
+                max_id2 = v;
+                if (v == 0x15U) {
+                    max_bus_no = 2U;
+                    max_part_id = v;
+                    max_bp = &bus1;      /* 关键: 兜底走 I2C1 时, 后续读写必须指向 bus1 */
+                }
+            }
+        }
+    }
+    if (max_bus_no == 0U) return 1U;
+
+    (void)max_rd(0xFEU, &max_rev_id);                       /* REVISION_ID */
+
+    (void)max_wr(MAX_MODE_CONFIG, 0x40U);                   /* soft reset */
+    delay_ms(50U);
+    {
+        uint8_t tries = 0U;
+        while (tries++ < 50U) {
+            if (max_rd(MAX_MODE_CONFIG, &v) != 0U) break;
+            if ((v & 0x40U) == 0U) break;
+            delay_ms(10U);
+        }
+    }
+    (void)max_wr(MAX_FIFO_WR_PTR, 0x00U);
+    (void)max_wr(MAX_OVF_COUNTER, 0x00U);
+    (void)max_wr(MAX_FIFO_RD_PTR, 0x00U);
+    (void)max_wr(MAX_FIFO_CONFIG, 0x3FU);                   /* SMP_AVE=2 -> 输出 50Hz, 噪声降 √2 */
+    (void)max_wr(MAX_MODE_CONFIG, 0x03U);                   /* SpO2: Red + IR */
+    (void)max_wr(MAX_SPO2_CONFIG, 0x27U);                   /* 100Hz 采样/411us/18bit, 再经 2 次平均=50Hz */
+    (void)max_wr(MAX_LED1_PA, 0x34U);                       /* Red 电流 10.4mA */
+    (void)max_wr(MAX_LED2_PA, 0x34U);                       /* IR  电流 10.4mA */
+
+    /* 配置回读: 确认寄存器真的写进去了, 以及 FIFO 指针会不会走 */
+    {
+        uint8_t mode = 0U, spo2 = 0U, fifo = 0U, wrp = 0U, rdp = 0U, ovf = 0U;
+        (void)max_rd(MAX_MODE_CONFIG, &mode);
+        (void)max_rd(MAX_SPO2_CONFIG, &spo2);
+        (void)max_rd(MAX_FIFO_CONFIG, &fifo);
+        (void)max_rd(MAX_FIFO_WR_PTR, &wrp);
+        (void)max_rd(MAX_FIFO_RD_PTR, &rdp);
+        (void)max_rd(MAX_OVF_COUNTER, &ovf);
+        dbg_regs[0] = ((uint32_t)mode << 24) | ((uint32_t)spo2 << 16) |
+                      ((uint32_t)fifo << 8) | (uint32_t)max_part_id;
+        dbg_regs[1] = ((uint32_t)wrp << 24) | ((uint32_t)ovf << 16) | ((uint32_t)rdp << 8);
+    }
+    return 0U;
+}
+
+volatile uint32_t dbg_fifo;   /* [31:24]=WR_PTR [23:16]=RD_PTR [15:8]=本次读的样本数 [7:0]=返回码 */
+volatile uint32_t dbg_bad;    /* 被剔除的坏样本个数(IR 低字节=0xFF) */
+volatile uint32_t dbg_ac;     /* 自相关兜底生效的次数 */
+volatile uint32_t dbg_ac_lag; /* 最近一次自相关给出的周期 lag(样本) */
+volatile uint32_t dbg_ac_cyc; /* 自相关单次耗时(内核周期数, /8011 = ms) */
+volatile uint32_t dbg_reinit; /* 运行期发现 MAX30102 配置丢失而整片重配的次数 */
+static uint8_t oled_fail_cnt; /* OLED 连续 ping 失败计数 */
+
+/* 总线复位: 从机在传输中途被打断时会一直占着 SDA, 只有手动送时钟才能把它推回空闲。
+   做法: 关 I2C1 外设 -> PB6/PB7 变普通开漏 -> 打 9 个 SCL 脉冲 -> 补一个 STOP -> 重配 I2C。 */
+static void i2c1_bus_recover(void)
+{
+    uint16_t k;
+    uint32_t d;
+
+    I2C1_CR1 = 0U;                                 /* PE=0, 引脚交回 GPIO(宏本身已是解引用, 不要再取*) */
+    GPIOB_CRL &= ~(0xFFU << 24);
+    GPIOB_CRL |=  (0x77U << 24);                   /* PB6/PB7 通用开漏输出 50MHz */
+    GPIOB_ODR |=  (0x03U << 6);
+    for (d = 0U; d < 60U; d++) { }
+
+    for (k = 0U; k < 9U; k++) {
+        GPIOB_ODR &= ~(1U << 6);
+        for (d = 0U; d < 240U; d++) { }
+        GPIOB_ODR |=  (1U << 6);
+        for (d = 0U; d < 240U; d++) { }
+    }
+    GPIOB_ODR &= ~(1U << 7);                       /* SDA 低 -> 高, 期间 SCL 为高 = STOP */
+    for (d = 0U; d < 240U; d++) { }
+    GPIOB_ODR |=  (1U << 7);
+    for (d = 0U; d < 240U; d++) { }
+
+    i2c_init(&bus1);
+}
+
+/* OLED 自维护: 实测 I2C1 上 SH1106 会间歇性漏 ACK, 表现为整屏停在旧画面("卡住不动")。
+   连续 5 次通信失败就复位总线并重发初始化序列。 */
+static void oled_health(void)
+{
+    static uint32_t t_next = 0U;       /* 下次允许试探的时刻 */
+    uint32_t now = now_ms();
+    uint8_t r;
+
+    if (now < t_next) return;          /* 屏没接时别每秒折腾, 否则主循环会被拖到 1 秒才转一圈 */
+
+    r = i2c_ping(&bus1, OLED_ADDR);
+    if (r == 0U) {
+        oled_fail_cnt = 0U;
+        if (!oled_present) {
+            if (i2c_write(&bus1, OLED_ADDR, oled_init_seq, (uint16_t)sizeof(oled_init_seq)) == 0U) {
+                oled_present = 1U;
+                oled_clear();
+            }
+        }
+        t_next = now + 1000U;
+        return;
+    }
+
+    if (!oled_present) {               /* 本来就没屏: 10 秒才试一次 */
+        t_next = now + 10000U;
+        return;
+    }
+    if (++oled_fail_cnt < 3U) { t_next = now + 1000U; return; }
+    oled_fail_cnt = 0U;
+    i2c1_bus_recover();
+    if (i2c_write(&bus1, OLED_ADDR, oled_init_seq, (uint16_t)sizeof(oled_init_seq)) == 0U) {
+        oled_present = 1U;
+        oled_clear();
+        t_next = now + 1000U;
+    } else {
+        oled_present = 0U;             /* 连续失败: 判定为没接屏, 之后 10 秒才试探 */
+        t_next = now + 10000U;
+    }
+}
+
+volatile uint32_t dbg_led_ir_max;   /* 单独开 IR LED(25mA) 时 IR 通道原始值最大值 */volatile uint32_t dbg_led_red_max;  /* 单独开 RED LED(25mA) 时 RED 通道原始值最大值 */
+
+/* 硬件自检: 分别只点亮一路 LED 到 25mA, 看对应通道的原始计数能不能起来。
+   IR 通道起不来 = 红外 LED 没发光(驱动/焊接/芯片), 起得来 = 光路或手指位置问题。 */
+static uint32_t led_probe_one(uint8_t pa1, uint8_t pa2, uint8_t pick_ir)
+{
+    static uint8_t b[36];
+    uint32_t mx = 0U, v;
+    uint8_t i, n, rc;
+
+    (void)max_wr(MAX_LED1_PA, pa1);
+    (void)max_wr(MAX_LED2_PA, pa2);
+    (void)max_wr(MAX_FIFO_WR_PTR, 0x00U);
+    (void)max_wr(MAX_OVF_COUNTER, 0x00U);
+    (void)max_wr(MAX_FIFO_RD_PTR, 0x00U);
+    delay_ms(120U);
+    for (n = 0U; n < 10U; n++) {                    /* 先扔掉积压样本 */
+        (void)max_rd_blk(MAX_FIFO_DATA, b, 36U);
+        delay_ms(50U);
+    }
+    for (n = 0U; n < 10U; n++) {
+        rc = max_rd_blk(MAX_FIFO_DATA, b, 36U);
+        if (rc == 0U) {
+            for (i = 0U; i < 6U; i++) {
+                uint8_t j = (uint8_t)(i * 6U);
+                if (pick_ir) {
+                    v = (((uint32_t)b[j + 3U] << 16) | ((uint32_t)b[j + 4U] << 8) | (uint32_t)b[j + 5U]) & 0x3FFFFU;
+                } else {
+                    v = (((uint32_t)b[j] << 16) | ((uint32_t)b[j + 1U] << 8) | (uint32_t)b[j + 2U]) & 0x3FFFFU;
+                }
+                if (v > mx) mx = v;
+            }
+        }
+        delay_ms(40U);
+    }
+    return mx;
+}
+
+static void led_probe(void)
+{
+    if (max_present == 0U) return;
+    (void)max_wr(MAX_SPO2_CONFIG, 0x27U);
+    (void)max_wr(MAX_MODE_CONFIG, 0x03U);
+
+    dbg_led_ir_max  = led_probe_one(0x00U, 0x7FU, 1U);   /* 只开 IR 25mA */
+    dbg_led_red_max = led_probe_one(0x7FU, 0x00U, 0U);   /* 只开 RED 25mA */
+
+    (void)max_wr(MAX_LED1_PA, 0x34U);
+    (void)max_wr(MAX_LED2_PA, 0x34U);
+    (void)max_wr(MAX_FIFO_WR_PTR, 0x00U);
+    (void)max_wr(MAX_OVF_COUNTER, 0x00U);
+    (void)max_wr(MAX_FIFO_RD_PTR, 0x00U);
+
+    /* 自检期间的样本必须清掉, 否则会被当成"有手指"的数据算出假血氧 */
+    {
+        uint8_t i;
+        for (i = 0U; i < 100U; i++) { ir_buf[i] = 0U; red_buf[i] = 0U; }
+    }
+    buf_idx = 0U;
+    max_ir_raw = 0U;
+    max_red_raw = 0U;
+}
+
+/* 芯片自维护: 刷屏/蓝牙电流把 3V3 拉低时, MAX30102 会内部掉电复位,
+   配置退回默认的"仅红光 HR 模式"(MODE=0x02)。此时只有红灯亮、IR 全无数据,
+   表现出来就是"红外读数为环境光、按压毫无反应"。每秒校验一次, 一漂就整片重配。 */
+static void max_health_check(void)
+{
+    uint8_t part = 0U, mode = 0U, spo2 = 0U, pa2 = 0U, bad = 0U;
+
+    if (max_rd(MAX_PART_ID, &part) != 0U || part != 0x15U) bad = 1U;
+    if (max_rd(MAX_MODE_CONFIG, &mode) != 0U || mode != 0x03U) bad = 1U;
+    if (max_rd(MAX_SPO2_CONFIG, &spo2) != 0U || spo2 != 0x27U) bad = 1U;
+    if (max_rd(MAX_LED2_PA, &pa2) != 0U || pa2 != 0x34U) bad = 1U;
+
+    if (bad) {
+        dbg_reinit++;
+        max_present = (max_init() == 0U) ? 1U : 0U;
+    }
+}
+
+static uint8_t max_read_fifo(void)
+{
+    static uint8_t b[192];
+    static uint8_t last_ir_lsb = 0U;
+    uint8_t k, j, rc, want, wr = 0U, rd = 0U;
+
+    /* 先读 FIFO 写指针/读指针, 用它们的差值决定"这次到底有几个样本可读", 再突发读。
+       这是唯一能彻底避免"猜多读空"的办法: 读超时芯片把总线空闲电平 0xFF 填进样本低位,
+       波形里就冒出 0x21AFF / 0x21BFF 这种伪点, Maxim 算法随即判无效, 上位机报信号质量差。
+       (0x04 = FIFO_WR_PTR, 0x06 = FIFO_RD_PTR, 都是 0~31 的环形指针) */
+    if (max_rd(MAX_FIFO_WR_PTR, &wr) != 0U) return 2U;
+    if (max_rd(MAX_FIFO_RD_PTR, &rd) != 0U) return 2U;
+    if (wr > 31U) wr = (uint8_t)(wr & 0x1FU);
+    if (rd > 31U) rd = (uint8_t)(rd & 0x1FU);
+    want = (wr >= rd) ? (uint8_t)(wr - rd) : (uint8_t)(32U + wr - rd);
+    want = (uint8_t)(want & 0x1FU);          /* 32 视作 0: 指针同值 */
+    dbg_fifo = ((uint32_t)wr << 24) | ((uint32_t)rd << 16) | ((uint32_t)want << 8);
+    if (want < 4U) return 0U;                /* 攒够 4 个再读, 避免一个样本一个事务 */
+
+    rc = max_rd_blk(MAX_FIFO_DATA, b, (uint16_t)((uint16_t)want * 6U));
+    dbg_fifo = ((uint32_t)wr << 24) | ((uint32_t)rd << 16) | ((uint32_t)want << 8) | (uint32_t)rc;
+    if (rc != 0U) return 2U;
+
+    for (k = 0U; k < want; k++) {
+        j = (uint8_t)(k * 6U);
+        red_buf[buf_idx] = (((uint32_t)b[j] << 16) | ((uint32_t)b[j + 1U] << 8) | (uint32_t)b[j + 2U]) & 0x3FFFFU;
+        ir_buf[buf_idx]  = (((uint32_t)b[j + 3U] << 16) | ((uint32_t)b[j + 4U] << 8) | (uint32_t)b[j + 5U]) & 0x3FFFFU;
+        /* 坏字节修复: 本板实测约 15% 的 IR 样本末字节被读成 0xFF(总线空闲电平),
+           直接算会得到 0x21EFF/0x21FFF 这种伪尖峰, Maxim 算法随即判无效。
+           末字节本来只有 1/256 概率是 0xFF, 所以判为坏值, 用上一个样本的低字节补齐:
+           误差最多 255/139000 = 0.18%, 既能保住 100Hz 的均匀节拍, 又不会制造尖峰。 */
+        if ((ir_buf[buf_idx] & 0xFFU) == 0xFFU) {
+            dbg_bad++;
+            ir_buf[buf_idx] = (ir_buf[buf_idx] & 0xFFFF00U) | (uint32_t)last_ir_lsb;
+        } else {
+            last_ir_lsb = (uint8_t)(ir_buf[buf_idx] & 0xFFU);
+        }
+        max_red_raw = red_buf[buf_idx];
+        max_ir_raw  = ir_buf[buf_idx];
+        if (pbuf_cnt < (uint16_t)BUFFER_SIZE) {          /* 喂给 Maxim 算法的 4 秒窗口 */
+            pbuf_ir[pbuf_cnt]  = ir_buf[buf_idx];
+            pbuf_red[pbuf_cnt] = red_buf[buf_idx];
+            pbuf_cnt++;
+        }
+        buf_idx = (uint8_t)((buf_idx + 1U) % 100U);
+        dbg_smp++;
+
+        if (wave_cnt < 2U) {
+            uint8_t last = (uint8_t)((buf_idx + 99U) % 100U);
+            wave_ir[wave_cnt]  = ir_buf[last];
+            wave_red[wave_cnt] = red_buf[last];
+            wave_cnt++;
+        }
+    }
+    return 0U;
+}
+
+/* ==================== 算法 ==================== */
+static float spo2_val, pr_val, pi_val;
+static uint8_t spo2_valid;
+static uint8_t pr_ac_used;   /* 本窗 PR 是否来自自相关兜底(屏显标 [AC] 用) */
+static float pitch_val, roll_val;
+
+static int16_t isqrt32(int32_t v)
+{
+    int16_t r = 0;
+    if (v <= 0) return 0;
+    while ((int32_t)(r + 1) * (r + 1) <= v && r < 32767) r++;
+    return r;
+}
+
+/* 无有效信号时把三个指标全部清零, 避免上位机继续显示旧值 */
+static void clear_vitals(void)
+{
+    spo2_val = 0.0f;
+    pr_val   = 0.0f;
+    pi_val   = 0.0f;
+    spo2_valid = 0U;
+}
+
+/* 不开 libm 的简易平方根: 牛顿迭代 */
+static float fsqrt(float x)
+{
+    float y = 1.0f;
+    uint8_t i;
+    if (x <= 0.0f) return 0.0f;
+    while (y * y < x && y < 1000000.0f) y *= 2.0f;
+    for (i = 0U; i < 10U; i++) y = 0.5f * (y + x / y);
+    return y;
+}
+
+/* ==================== Maxim 官方血氧/脉率算法(移植) ====================
+   来源: 辰哥单片机设计 MAX30102 工程 HARDWARE/MAX30102/max30102.c,
+   本质是 Maxim(ADI) 官方 maxim_heart_rate_and_oxygen_saturation:
+   去直流 -> 4 点滑动平均 -> 一阶差分 -> 汉明窗 -> 峰检测求心率 ->
+   谷点间求 IR/RED 的 AC/DC 比 -> 查 uch_spo2_table(184 项)得 SpO2。
+   它比自己写的均方根+限幅稳得多, 且自带 valid 标志, 无效时返回 -999。 */
+#define MIN2(x,y)    ((x) < (y) ? (x) : (y))
+
+static int32_t an_x[BUFFER_SIZE];
+static int32_t an_y[BUFFER_SIZE];
+static int32_t an_dx[BUFFER_SIZE - MA4_SIZE];
+
+static const uint16_t auw_hamm[31] = { 41, 276, 512, 276, 41 };  /* 5 阶汉明窗, 和=1146 */
+static const uint8_t uch_spo2_table[184] = {
+    95, 95, 95, 96, 96, 96, 97, 97, 97, 97, 97, 98, 98, 98, 98, 98, 99, 99, 99, 99,
+    99, 99, 99, 99, 100, 99, 99, 99, 99, 99, 99, 99, 98, 98, 98, 98, 98, 98, 97, 97,
+    97, 97, 96, 96, 96, 96, 95, 95, 95, 94, 94, 94, 93, 93, 93, 92, 92, 92, 91, 91,
+    90, 90, 89, 89, 89, 88, 88, 87, 87, 86, 86, 85, 85, 84, 84, 83, 82, 82, 81, 81,
+    80, 80, 79, 78, 78, 77, 76, 76, 75, 74, 74, 73, 72, 72, 71, 70, 69, 69, 68, 67,
+    66, 66, 65, 64, 63, 62, 62, 61, 60, 59, 58, 57, 56, 56, 55, 54, 53, 52, 51, 50,
+    49, 48, 47, 46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 31, 30, 29,
+    28, 27, 26, 25, 23, 22, 21, 20, 19, 17, 16, 15, 14, 12, 11, 10, 9,  7,  6,  5,
+    3,  2,  1,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    0,  0,  0,  0
+};
+
+static void maxim_sort_ascend(int32_t *pn_x, int32_t n_size)
+{
+    int32_t i, j, n_temp;
+    for (i = 1; i < n_size; i++) {
+        n_temp = pn_x[i];
+        for (j = i; j > 0 && n_temp < pn_x[j - 1]; j--) pn_x[j] = pn_x[j - 1];
+        pn_x[j] = n_temp;
+    }
+}
+
+static void maxim_sort_indices_descend(int32_t *pn_x, int32_t *pn_indx, int32_t n_size)
+{
+    int32_t i, j, n_temp;
+    for (i = 1; i < n_size; i++) {
+        n_temp = pn_indx[i];
+        for (j = i; j > 0 && pn_x[n_temp] > pn_x[pn_indx[j - 1]]; j--) pn_indx[j] = pn_indx[j - 1];
+        pn_indx[j] = n_temp;
+    }
+}
+
+static void maxim_peaks_above_min_height(int32_t *pn_locs, int32_t *pn_npks, int32_t *pn_x,
+                                         int32_t n_size, int32_t n_min_height)
+{
+    int32_t i = 1, n_width;
+    *pn_npks = 0;
+    while (i < n_size - 1) {
+        if (pn_x[i] > n_min_height && pn_x[i] > pn_x[i - 1]) {
+            n_width = 1;
+            while ((i + n_width) < n_size && pn_x[i] == pn_x[i + n_width]) n_width++;
+            if (pn_x[i] > pn_x[i + n_width] && (*pn_npks) < 15) {
+                pn_locs[(*pn_npks)++] = i;
+                i += n_width + 1;
+            } else {
+                i += n_width;
+            }
+        } else {
+            i++;
+        }
+    }
+}
+
+static void maxim_remove_close_peaks(int32_t *pn_locs, int32_t *pn_npks, int32_t *pn_x,
+                                     int32_t n_min_distance)
+{
+    int32_t i, j, n_old_npks, n_dist;
+    maxim_sort_indices_descend(pn_x, pn_locs, *pn_npks);
+    for (i = -1; i < *pn_npks; i++) {
+        n_old_npks = *pn_npks;
+        *pn_npks = i + 1;
+        for (j = i + 1; j < n_old_npks; j++) {
+            n_dist = pn_locs[j] - (i == -1 ? -1 : pn_locs[i]);
+            if (n_dist > n_min_distance || n_dist < -n_min_distance) pn_locs[(*pn_npks)++] = pn_locs[j];
+        }
+    }
+    maxim_sort_ascend(pn_locs, *pn_npks);
+}
+
+static void maxim_find_peaks(int32_t *pn_locs, int32_t *pn_npks, int32_t *pn_x, int32_t n_size,
+                             int32_t n_min_height, int32_t n_min_distance, int32_t n_max_num)
+{
+    maxim_peaks_above_min_height(pn_locs, pn_npks, pn_x, n_size, n_min_height);
+    maxim_remove_close_peaks(pn_locs, pn_npks, pn_x, n_min_distance);
+    *pn_npks = MIN2(*pn_npks, n_max_num);
+}
+
+static void maxim_heart_rate_and_oxygen_saturation(uint32_t *pun_ir_buffer, int32_t n_ir_buffer_length,
+                                                   uint32_t *pun_red_buffer, int32_t *pn_spo2, int8_t *pch_spo2_valid,
+                                                   int32_t *pn_heart_rate, int8_t *pch_hr_valid)
+{
+    uint32_t un_ir_mean, un_only_once;
+    int32_t k, n_i_ratio_count, i, s, m, n_exact_ir_valley_locs_count, n_middle_idx;
+    int32_t n_th1, n_npks, n_c_min;
+    int32_t an_ir_valley_locs[15], an_exact_ir_valley_locs[15], an_dx_peak_locs[15];
+    int32_t n_peak_interval_sum, n_y_ac, n_x_ac, n_spo2_calc;
+    int32_t n_y_dc_max, n_x_dc_max, n_y_dc_max_idx, n_x_dc_max_idx;
+    int32_t an_ratio[5], n_ratio_average, n_nume, n_denom;
+
+    un_ir_mean = 0U;
+    for (k = 0; k < n_ir_buffer_length; k++) un_ir_mean += pun_ir_buffer[k];
+    un_ir_mean = un_ir_mean / (uint32_t)n_ir_buffer_length;
+    for (k = 0; k < n_ir_buffer_length; k++) an_x[k] = (int32_t)(pun_ir_buffer[k] - un_ir_mean);
+
+    for (k = 0; k < BUFFER_SIZE - MA4_SIZE; k++) {
+        n_denom = an_x[k] + an_x[k + 1] + an_x[k + 2] + an_x[k + 3];
+        an_x[k] = n_denom / 4;
+    }
+    for (k = 0; k < BUFFER_SIZE - MA4_SIZE - 1; k++) an_dx[k] = an_x[k + 1] - an_x[k];
+    for (k = 0; k < BUFFER_SIZE - MA4_SIZE - 2; k++) an_dx[k] = (an_dx[k] + an_dx[k + 1]) / 2;
+    for (i = 0; i < BUFFER_SIZE - HAMMING_SIZE - MA4_SIZE - 2; i++) {
+        s = 0;
+        for (k = i; k < i + HAMMING_SIZE; k++) s -= an_dx[k] * (int32_t)auw_hamm[k - i];
+        an_dx[i] = s / 1146;
+    }
+
+    n_th1 = 0;
+    for (k = 0; k < BUFFER_SIZE - HAMMING_SIZE; k++)
+        n_th1 += ((an_dx[k] > 0) ? an_dx[k] : (0 - an_dx[k]));
+    n_th1 = n_th1 / (BUFFER_SIZE - HAMMING_SIZE);
+
+    maxim_find_peaks(an_dx_peak_locs, &n_npks, an_dx, BUFFER_SIZE - HAMMING_SIZE, n_th1, 8, 5);
+
+    n_peak_interval_sum = 0;
+    if (n_npks >= 2) {
+        for (k = 1; k < n_npks; k++) n_peak_interval_sum += (an_dx_peak_locs[k] - an_dx_peak_locs[k - 1]);
+        n_peak_interval_sum = n_peak_interval_sum / (n_npks - 1);
+        if (n_peak_interval_sum > 0) {
+            *pn_heart_rate = 3000 / n_peak_interval_sum;   /* 50Hz 采样(100sps × 2 次平均): 60*50/间隔 */
+            *pch_hr_valid = 1;
+        } else {
+            *pn_heart_rate = -999;
+            *pch_hr_valid = 0;
+        }
+    } else {
+        *pn_heart_rate = -999;
+        *pch_hr_valid = 0;
+    }
+
+    for (k = 0; k < n_npks; k++) an_ir_valley_locs[k] = an_dx_peak_locs[k] + HAMMING_SIZE / 2;
+
+    for (k = 0; k < n_ir_buffer_length; k++) {
+        an_x[k] = (int32_t)pun_ir_buffer[k];
+        an_y[k] = (int32_t)pun_red_buffer[k];
+    }
+    n_exact_ir_valley_locs_count = 0;
+    for (k = 0; k < n_npks; k++) {
+        un_only_once = 1U;
+        m = an_ir_valley_locs[k];
+        n_c_min = 16777216;
+        if ((m + 5) < (BUFFER_SIZE - HAMMING_SIZE) && (m - 5) > 0) {
+            for (i = m - 5; i < m + 5; i++) {
+                if (an_x[i] < n_c_min) {
+                    if (un_only_once > 0U) un_only_once = 0U;
+                    n_c_min = an_x[i];
+                    an_exact_ir_valley_locs[k] = i;
+                }
+            }
+            if (un_only_once == 0U) n_exact_ir_valley_locs_count++;
+        }
+    }
+    if (n_exact_ir_valley_locs_count < 2) {
+        *pn_spo2 = -999;
+        *pch_spo2_valid = 0;
+        return;
+    }
+    for (k = 0; k < BUFFER_SIZE - MA4_SIZE; k++) {
+        an_x[k] = (an_x[k] + an_x[k + 1] + an_x[k + 2] + an_x[k + 3]) / 4;
+        an_y[k] = (an_y[k] + an_y[k + 1] + an_y[k + 2] + an_y[k + 3]) / 4;
+    }
+
+    n_ratio_average = 0;
+    n_i_ratio_count = 0;
+    for (k = 0; k < 5; k++) an_ratio[k] = 0;
+    for (k = 0; k < n_exact_ir_valley_locs_count; k++) {
+        if (an_exact_ir_valley_locs[k] > BUFFER_SIZE) {
+            *pn_spo2 = -999;
+            *pch_spo2_valid = 0;
+            return;
+        }
+    }
+    for (k = 0; k < n_exact_ir_valley_locs_count - 1; k++) {
+        n_y_dc_max = -16777216;
+        n_x_dc_max = -16777216;
+        if ((an_exact_ir_valley_locs[k + 1] - an_exact_ir_valley_locs[k]) > 10) {
+            for (i = an_exact_ir_valley_locs[k]; i < an_exact_ir_valley_locs[k + 1]; i++) {
+                if (an_x[i] > n_x_dc_max) { n_x_dc_max = an_x[i]; n_x_dc_max_idx = i; }
+                if (an_y[i] > n_y_dc_max) { n_y_dc_max = an_y[i]; n_y_dc_max_idx = i; }
+            }
+            n_y_ac = (an_y[an_exact_ir_valley_locs[k + 1]] - an_y[an_exact_ir_valley_locs[k]]) *
+                     (n_y_dc_max_idx - an_exact_ir_valley_locs[k]);
+            n_y_ac = an_y[an_exact_ir_valley_locs[k]] + n_y_ac / (an_exact_ir_valley_locs[k + 1] - an_exact_ir_valley_locs[k]);
+            n_y_ac = an_y[n_y_dc_max_idx] - n_y_ac;
+            n_x_ac = (an_x[an_exact_ir_valley_locs[k + 1]] - an_x[an_exact_ir_valley_locs[k]]) *
+                     (n_x_dc_max_idx - an_exact_ir_valley_locs[k]);
+            n_x_ac = an_x[an_exact_ir_valley_locs[k]] + n_x_ac / (an_exact_ir_valley_locs[k + 1] - an_exact_ir_valley_locs[k]);
+            n_x_ac = an_x[n_x_dc_max_idx] - n_x_ac;   /* 原工程误写成 an_x[n_y_dc_max_idx], 已修正 */
+            n_nume = (n_y_ac * n_x_dc_max) >> 7;
+            n_denom = (n_x_ac * n_y_dc_max) >> 7;
+            if (n_denom > 0 && n_i_ratio_count < 5 && n_nume != 0) {
+                an_ratio[n_i_ratio_count] = (n_nume * 20) / n_denom;
+                n_i_ratio_count++;
+            }
+        }
+    }
+
+    maxim_sort_ascend(an_ratio, n_i_ratio_count);
+    n_middle_idx = n_i_ratio_count / 2;
+    if (n_i_ratio_count == 0) {
+        *pn_spo2 = -999;
+        *pch_spo2_valid = 0;
+        return;
+    }
+    if (n_middle_idx > 1) n_ratio_average = (an_ratio[n_middle_idx - 1] + an_ratio[n_middle_idx]) / 2;
+    else                 n_ratio_average = an_ratio[n_middle_idx];
+
+    if (n_ratio_average > 2 && n_ratio_average < 184) {
+        n_spo2_calc = (int32_t)uch_spo2_table[n_ratio_average];
+        *pn_spo2 = n_spo2_calc;
+        *pch_spo2_valid = 1;
+    } else {
+        *pn_spo2 = -999;
+        *pch_spo2_valid = 0;
+    }
+}
+
+/* 每攒满 8 秒(400 样本 @50Hz)算一次, 之后每次滑掉 1 秒 → 1Hz 刷新 */
+/* ==================== 脉率兜底: 去趋势 + 自相关 ====================
+   Maxim 的峰间隔法在低灌注(按压偏轻/手脚冰凉)时, 重搏波(dicrotic notch)的上升沿
+   会被当成"第二个峰", 峰间隔被压短, PR 偏高甚至翻倍(实测出现过 195bpm)。
+   这里用同一窗口的 IR 做第二道防线:
+     1) 16 点滑动均值当基线做高通, x[i] = IR[i] - mean16(IR);
+     2) 归一化自相关 r(lag) = Σx[i]x[i+lag] / ((Σx[i]² + Σx[i+lag]²)/2);
+     3) 先按生理区间 lag ∈ [26,40](75~115bpm) 找最大, 防倍周期锁定(把两拍当一拍);
+        该区间无峰时再退回 [18,80] 全区间取最大, 且 r ≥ 0.30;
+     4) PR = 60·fs/lag = 3000/lag (fs = 50Hz)。
+   全 int32 乘加, 不开方, 8MHz 下几十毫秒, 每秒调用一次。 */
+#define AC_MW      16U
+#define AC_LAG_MIN 18U
+#define AC_LAG_MAX 80U
+#define AC_R_MIN   0.20f   /* 生理区间门限: 实测 90bpm 时基频 r≈0.28, 2 倍周期只有 0.23 */
+#define AC_R_FULL  0.30f   /* 全区间兜底门限, 放宽后容易收到噪声 */
+
+/* ============ 临时串口诊断 (定位"上位机 0 字节"用) ============
+   1 = 打开: 主循环以 0xA55.. 短帧在 9600/19200/38400/57600/115200 之间
+       每 1.5s 轮换一次, 每 100ms 发一帧;
+   0 = 关闭, 恢复正常协议帧。诊断完务必改回 0。 */
+#define UART_DIAG  0
+#define UART_MUTE  0      /* 0 = 正常对外发送 */
+static float ac_r_buf[AC_LAG_MAX + 2U];
+float g_ac_r;   /* 本次自相关选中 lag 的 r 值, 供 SWD 探针读取 */
+
+static uint16_t hr_by_autocorr(const uint32_t *buf, uint16_t n, float *r_out)
+{
+    uint16_t i, lag, lo, hi, cnt;
+    int32_t  sum, m, ax, max_abs = 0;
+    int32_t  e0, e1, num;
+    float    r_cur;
+    uint16_t best = 0U;
+
+    if (n < AC_LAG_MAX + 20U) return 0U;
+
+    /* 1) 16 点滑动均值去趋势(高通), 结果复用 an_x(400 点 int32) */
+    for (i = 0U; i < n; i++) {
+        lo = (i > (AC_MW / 2U)) ? (uint16_t)(i - AC_MW / 2U) : 0U;
+        hi = (uint16_t)(i + AC_MW / 2U);
+        if (hi >= n) hi = (uint16_t)(n - 1U);
+        sum = 0;
+        for (cnt = lo; cnt <= hi; cnt++) sum += (int32_t)buf[cnt];
+        cnt = (uint16_t)(hi - lo + 1U);
+        m = sum / (int32_t)cnt;
+        ax = (int32_t)buf[i] - m;
+        an_x[i] = ax;
+        if (ax < 0) ax = -ax;
+        if (ax > max_abs) max_abs = ax;
+    }
+    /* 手指刚放上/移开的过渡窗残差极大, 这一窗不自作聪明 */
+    if (max_abs > 25000) return 0U;
+
+    /* 2) 归一化自相关(用能量均值代替几何均值, 省掉 111 次开方) */
+    for (lag = AC_LAG_MIN; lag <= AC_LAG_MAX; lag++) {
+        num = 0; e0 = 0; e1 = 0;
+        for (i = 0U; i < (uint16_t)(n - lag); i++) {
+            int32_t a = an_x[i];
+            int32_t b = an_x[i + lag];
+            num += a * b;
+            e0  += a * a;
+            e1  += b * b;
+        }
+        if ((e0 + e1) > 0) {
+            ac_r_buf[lag] = (float)num * 2.0f / (float)(e0 + e1);
+        } else {
+            ac_r_buf[lag] = 0.0f;
+        }
+    }
+
+    /* 3) 先按生理区间(26~40 → 75~115bpm)取最大, 这一步专门防"倍周期锁定":
+       真实 ~92bpm 时周期约 33 点, 但自相关在 lag≈57(2 倍周期)可能更高,
+       若直接取全局最大就会把两拍当一拍, PR 掉到 52。 */
+    r_cur = 0.0f;
+    for (lag = 26U; lag <= 40U; lag++) {
+        if (ac_r_buf[lag] > r_cur) { r_cur = ac_r_buf[lag]; best = lag; }
+    }
+    if (best > 0U && r_cur >= AC_R_MIN) {
+        if (r_out) *r_out = r_cur;
+        g_ac_r = r_cur;
+        return best;
+    }
+
+    /* 4) 生理区间内没有峰(心率确实很低/很高或信号差), 再退回全区间取最大 */
+    best = 0U;
+    r_cur = 0.0f;
+    for (lag = AC_LAG_MIN; lag <= AC_LAG_MAX; lag++) {
+        if (ac_r_buf[lag] > r_cur) { r_cur = ac_r_buf[lag]; best = lag; }
+    }
+    if (best > 0U && r_cur < AC_R_FULL) best = 0U;
+    if (best > 0U && r_out) *r_out = ac_r_buf[best];
+    g_ac_r = (best > 0U) ? ac_r_buf[best] : 0.0f;
+    return best;
+}
+
+/* ==================== 脉率主判据: 频域(Goertzel DFT) ====================
+   自相关在心率变异(HRV)下 lag 会被摊平: 同一段 90bpm 的信号, lag 会在 32~38 之间来回,
+   换算成 PR 就是 79~94 的跳动。频谱把整个窗口做相干积累, 峰位稳定得多:
+   实测两个独立窗口的 DFT 主峰都是 1.50Hz = 90.0bpm, 与手环 93/87/96 吻合。
+   做法: 对去趋势后的 x[] 在 k=8..17(1.0~2.1Hz)逐点 Goertzel, 取幅值最大的 bin,
+   再用相邻三点做抛物线插值细化频率 → PR = 60·f。 */
+#define SP_K_LO   6U      /* 0.75Hz ≈ 45bpm */
+#define SP_K_HI   20U     /* 2.50Hz ≈ 150bpm */
+#define SP_N      400U
+static float sp_cos[SP_K_HI + 2U];   /* cos(2πk/N) 表 */
+static uint8_t sp_init_done = 0U;
+
+static void sp_init(void)
+{
+    /* cos/sin 递推: theta = 2π/400 = 0.015708 */
+    float c0 = 0.99987663f, s0 = 0.01570732f;
+    float c = 1.0f, s = 0.0f, t;
+    uint16_t k;
+    for (k = 0U; k <= SP_K_HI + 1U; k++) {
+        sp_cos[k] = c;
+        t = c * c0 - s * s0;
+        s = s * c0 + c * s0;
+        c = t;
+    }
+    sp_init_done = 1U;
+}
+
+float g_sp_f;    /* 本次频谱主峰频率(Hz), 供 SWD 探针读取 */
+float g_sp_q;    /* 主峰幅值 / 平均幅值, 越大越干净 */
+
+static float hr_by_spectrum(const int32_t *x, uint16_t n, uint16_t *k_out)
+{
+    uint16_t k, i;
+    float s1, s2, s0, coeff, mag, best_mag = 0.0f, mprev = 0.0f, mnext = 0.0f;
+    float mags[SP_K_HI - SP_K_LO + 2U];
+    /* 跨窗平滑: 灌注很浅(PI≈0.6%)时相邻 bin 只差 1~3%, 单窗是谁最大纯属随机;
+       把最近 3 个窗的幅值做指数平滑(0.7 旧 + 0.3 新), 相当于 24 s 的准相干积累,
+       弱信号下峰位也不再左右横跳。 */
+    static float sp_sm[SP_K_HI - SP_K_LO + 2U];
+    static uint8_t sp_sm_n = 0U;
+    uint16_t best_k = 0U;
+    float mean_mag = 0.0f, delta, f;
+
+    if (!sp_init_done) sp_init();
+
+    for (k = SP_K_LO; k <= SP_K_HI; k++) {
+        coeff = 2.0f * sp_cos[k];
+        s1 = 0.0f; s2 = 0.0f;
+        for (i = 0U; i < n; i++) {
+            s0 = (float)x[i] + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        mag = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+        if (mag < 0.0f) mag = 0.0f;
+        mags[k - SP_K_LO] = mag;
+    }
+    /* 用哪一窗更新跨窗记忆, 先做一次可信性判断:
+       信号畸变(过压/松手瞬间)时能量会堆到搜索区间的端点, 如果还把这种谱写进 sp_sm,
+       0.7 的衰减要 20 秒才能把它忘掉 —— 实测就是这样出现 128→65→125 的整段漂移。
+       所以只有"峰在区间中部 且 峰/均值>=2"的窗才允许更新记忆。 */
+    {
+        float    raw_sum = 0.0f, raw_best = 0.0f;
+        uint16_t raw_k = SP_K_LO, kk;
+        uint8_t  raw_edge, raw_ok;
+
+        for (kk = SP_K_LO; kk <= SP_K_HI; kk++) {
+            float mm = mags[kk - SP_K_LO];
+            raw_sum += mm;
+            if (mm > raw_best) { raw_best = mm; raw_k = kk; }
+        }
+        raw_edge = (uint8_t)((raw_k <= (SP_K_LO + 1U)) || (raw_k >= (SP_K_HI - 1U)));
+        raw_ok   = (uint8_t)((!raw_edge) && (raw_sum > 0.0f) &&
+                    ((raw_best / (raw_sum / (float)(SP_K_HI - SP_K_LO + 1U))) >= 2.0f));
+
+        /* 过压(手指把动脉压扁, 波形削顶)时这一窗的谱不能写进记忆。
+           注意只是"不更新记忆", 不冻结输出 —— 冻结会让错误值一直挂到松手。 */
+        if (pi_val > 15.0f) raw_ok = 0U;
+
+        if (sp_sm_n == 0U) {
+            for (kk = 0U; kk <= (SP_K_HI - SP_K_LO); kk++) sp_sm[kk] = mags[kk];
+        } else if (raw_ok) {
+            for (kk = 0U; kk <= (SP_K_HI - SP_K_LO); kk++) {
+                sp_sm[kk] = 0.7f * sp_sm[kk] + 0.3f * mags[kk];
+            }
+        }
+        for (kk = 0U; kk <= (SP_K_HI - SP_K_LO); kk++) mags[kk] = sp_sm[kk];
+    }
+    if (sp_sm_n < 3U) sp_sm_n++;
+
+    for (k = SP_K_LO; k <= SP_K_HI; k++) {
+        mag = mags[k - SP_K_LO];
+        mean_mag += mag;
+        if (mag > best_mag) { best_mag = mag; best_k = k; }
+    }
+    mean_mag /= (float)(SP_K_HI - SP_K_LO + 1U);
+    if (k_out) *k_out = best_k;
+    if (best_mag <= 0.0f || mean_mag <= 0.0f) return 0.0f;
+    g_sp_q = best_mag / mean_mag;      /* 峰/均值 > ~3 才算真有周期 */
+
+    /* 峰贴在搜索区间边上 = 这一窗没有可信的基频(能量被畸变推到端点)。
+       实测过压/松手瞬间, 输出会在 65 和 126 之间来回, 正好就是这两个端点值,
+       所以贴边一律作废, 让上层退回自相关或保持上一次的有效值。 */
+    if ((best_k <= (SP_K_LO + 1U)) || (best_k >= (SP_K_HI - 1U))) {
+        g_sp_q = 0.0f;
+        return 0.0f;
+    }
+
+    /* 抛物线插值: 让 0.125Hz 的 bin 分辨率细化到 ~0.02Hz(≈1bpm) */
+    delta = 0.0f;
+    if (best_k > SP_K_LO && best_k < SP_K_HI) {
+        mprev = mags[best_k - SP_K_LO - 1U];
+        mnext = mags[best_k - SP_K_LO + 1U];
+        {
+            float den = (mprev - 2.0f * best_mag + mnext);
+            if (den < -1e-9f) delta = 0.5f * (mprev - mnext) / den;
+            if (delta > 0.5f)  delta = 0.5f;
+            if (delta < -0.5f) delta = -0.5f;
+        }
+    }
+    f = ((float)best_k + delta) * 50.0f / 400.0f;      /* fs=50Hz, N=400 */
+    g_sp_f = f;
+    return f * 60.0f;
+}
+
+/* 显示的脉率按 1 秒一次更新, 每次最多变 5bpm: 算法在相邻窗之间切换时数字不会"跳" */
+static float pr_slew(float cur, float target)
+{
+    float d = target - cur;
+    if (cur < 1.0f) return target;
+    if (d >  5.0f) d =  5.0f;
+    if (d < -5.0f) d = -5.0f;
+    return cur + d;
+}
+
+static void ppg_algo_run(void)
+{
+    int32_t sp = 0, hr = 0;
+    int8_t spv = 0, hrv = 0;
+    uint16_t i;
+    uint32_t sum_ir = 0U;
+
+    if (pbuf_cnt < BUFFER_SIZE) return;
+
+    /* 没手指时窗口里全是环境光(IR 均值 ~1.2k~5.1k), Maxim 算法仍可能在噪声里凑出 95% 的假血氧,
+       所以先用 IR 直流门限挡掉: 低于 8000 直接判为无信号, 不跑算法。 */
+    for (i = 0U; i < BUFFER_SIZE; i++) sum_ir += pbuf_ir[i];
+    if ((sum_ir / BUFFER_SIZE) < 8000U) {
+        spo2_val = 0.0f;
+        pr_val   = 0.0f;
+        pi_val   = 0.0f;
+        spo2_valid = 0U;
+        for (i = 0U; i < (uint16_t)(BUFFER_SIZE - 50); i++) {
+            pbuf_ir[i]  = pbuf_ir[i + 50U];
+            pbuf_red[i] = pbuf_red[i + 50U];
+        }
+        pbuf_cnt = (uint16_t)(BUFFER_SIZE - 50);
+        return;
+    }
+
+    maxim_heart_rate_and_oxygen_saturation(pbuf_ir, BUFFER_SIZE, pbuf_red, &sp, &spv, &hr, &hrv);
+
+    if (spv && sp != -999 && sp > 0) {
+        if (!spo2_valid) spo2_val = (float)sp;
+        else             spo2_val = spo2_val * 0.7f + (float)sp * 0.3f;
+        spo2_valid = 1U;
+    } else {
+        /* 某一窗没算出来就先保持上一次的数值(不置 0): 置 0 会让上位机直接判"无信号、质量差" */
+        spo2_valid = 0U;
+    }
+    /* 脉率: 混合(Hybrid)策略 —— Maxim 峰间隔法 + 自相关仲裁。
+       实测发现低灌注时重搏波被当成独立峰, Maxim 的平均峰间隔被压短, PR 约等于真实的 2 倍
+       (同一窗: 真实周期 ~60 样本(50bpm), Maxim 报 112bpm)。所以每个窗都跑一次自相关,
+       让它当"仲裁者":
+         - AC 无效 + Maxim 有效           -> 用 Maxim(时域法更精确、更省电);
+         - Maxim 无效                     -> 用 AC;
+         - Maxim 落在 1.4~3.0 倍 AC 之间  -> 判为重搏波多计, 用 AC(屏显 [AC]/dbg_ac++);
+         - 两者接近或 Maxim 反而更低      -> 信 Maxim。
+       单次耗时写进 dbg_ac_cyc, 供报告引用。 */
+    pr_ac_used = 0U;
+    {
+        float    ac_r = 0.0f, achr = 0.0f, spr = 0.0f;
+        uint16_t lag, spk = 0U;
+        uint32_t t0, t1;
+        uint8_t  hr_ok = (hrv && hr != -999 && hr > 20 && hr < 220) ? 1U : 0U;
+
+        t0  = DWT_CYCCNT;
+        lag = hr_by_autocorr(pbuf_ir, BUFFER_SIZE, &ac_r);   /* 顺便把去趋势结果填进 an_x */
+        {
+            /* lag 域投票: 自相关每窗可能选到相邻的次级峰(33/36/40 → 91/83/75 bpm),
+               单窗结果不可信, 只在相邻 lag 上跳 3~7 就已经让 PR 摆动 16。
+               取最近 15 窗里"出现最多、且互相相差不超过 1"的 lag 当周期;
+               两簇计数接近时取较短的那个 —— 倍周期错锁的峰总落在更长的 lag 上。 */
+            static uint8_t lag_ring[15];
+            static uint8_t lag_i = 0U, lag_n = 0U;
+
+            if (lag > 0U && ac_r >= 0.18f) {
+                float a = 3000.0f / (float)lag;
+                if (a >= 35.0f && a <= 140.0f) {
+                    achr = a;
+                    lag_ring[lag_i] = (uint8_t)lag;
+                    lag_i = (uint8_t)((lag_i + 1U) % 15U);
+                    if (lag_n < 15U) lag_n++;
+                }
+            }
+            if (lag_n >= 5U) {
+                uint8_t a, b, best_lag = 0U, best_cnt = 0U;
+                for (a = 0U; a < lag_n; a++) {
+                    uint8_t cnt = 0U;
+                    for (b = 0U; b < lag_n; b++) {
+                        int dd = (int)lag_ring[b] - (int)lag_ring[a];
+                        if (dd >= -1 && dd <= 1) cnt++;
+                    }
+                    if ((cnt > best_cnt) ||
+                        ((best_cnt > 0U) && (cnt + 1U >= best_cnt) && (lag_ring[a] < best_lag))) {
+                        best_cnt = cnt;
+                        best_lag = lag_ring[a];
+                    }
+                }
+                if (best_cnt >= 5U && best_lag > 0U) {
+                    achr = 3000.0f / (float)best_lag;
+                }
+            }
+        }
+        /* 主判据走频域: an_x 已是同一窗口的去趋势结果 */
+        spr = hr_by_spectrum(an_x, BUFFER_SIZE, &spk);
+        t1  = DWT_CYCCNT;
+        dbg_ac_cyc = t1 - t0;
+        if (spr < 40.0f || spr > 190.0f) spr = 0.0f;
+        /* 频谱主峰不够突出(峰/均值 < 3)就退回自相关的结果 */
+        if (spr > 0.0f && g_sp_q < 3.0f) { spr = 0.0f; }
+
+        if (spr > 0.5f || achr > 0.5f) {
+            /* 9 点中位数 + 判决迟滞: 手指微动/压力变化会让单窗判决在相邻 bin 之间翻转,
+               5 点挡不住; 9 点里要 5 个窗都指向同一值才会翻转。
+               再加一道迟滞: 与当前输出差 >12bpm 视为可疑跳变, 要连续 3 窗确认才改口,
+               单窗跳到 2 倍频/分频不会被直接显示出来。 */
+            static float   ac_hist[15];
+            static uint8_t ac_i = 0U, ac_n = 0U;
+            static uint8_t jump_n = 0U;
+            uint8_t hold = 0U;
+            float med, cand;
+
+            /* 谁当主判据由灌注水平决定:
+               自相关量的是相邻心搏的间隔(lag), 不理会波形里有没有重搏波、二次谐波,
+               所以 PI 够(>=2.5%)时以它为准; 频谱的峰位会随按压力改变而漂
+               (实测 PI 2.9→5.9 期间 PR 从 68 线性漂到 103, 而自相关一直给 93.8)。
+               灌注很差时自相关会被噪声小峰抢占, 这时才退回频域。 */
+            if (pi_val >= 2.5f) {
+                cand = (achr > 0.5f) ? achr : spr;
+            } else {
+                cand = (spr > 0.5f) ? spr : achr;
+            }
+            if (cand < 0.5f) cand = 0.0f;
+
+            ac_hist[ac_i] = cand;
+            ac_i = (uint8_t)((ac_i + 1U) % 15U);
+            if (ac_n < 15U) ac_n++;
+            if (ac_n >= 3U) {
+                float v[15], t;
+                uint8_t a, b;
+                for (a = 0U; a < ac_n; a++) v[a] = ac_hist[a];
+                for (a = 0U; a + 1U < ac_n; a++) {          /* 插入排序, 最多 15 个元素 */
+                    for (b = (uint8_t)(a + 1U); b > 0U; b--) {
+                        if (v[b - 1U] <= v[b]) break;
+                        t = v[b]; v[b] = v[b - 1U]; v[b - 1U] = t;
+                    }
+                }
+                med = v[ac_n >> 1];
+            } else {
+                med = cand;
+            }
+            /* [AC] 只在"本算法明显压过 Maxim"时点亮, 否则不打扰 */
+            if (hr_ok && ((float)hr - med) > med * 0.15f) pr_ac_used = 1U;
+            if ((pr_val >= 1.0f) && ((med - pr_val > 12.0f) || (pr_val - med > 12.0f))) {
+                if (jump_n < 3U) jump_n++;
+                if (jump_n < 3U) hold = 1U;
+            } else {
+                jump_n = 0U;
+            }
+            if (!hold) pr_val = pr_slew(pr_val, med);
+            dbg_ac++;
+            dbg_ac_lag = (uint32_t)((spr > 0.5f) ? spk : lag);
+        } else if (hr_ok) {
+            pr_val = pr_slew(pr_val, (float)hr);
+        }
+    }
+
+    /* 灌注指数 PI = IR 交流峰峰值 / IR 直流 ×100。
+       上位机就是靠这个字节判"信号质量", 之前一直没算(Maxim 算法只给 SpO2/HR), 发出去恒为 0,
+       所以永远是"信号质量差、只给原始 IR"。 */
+    {
+        uint32_t dc = sum_ir / BUFFER_SIZE;
+        uint32_t mx = 0U, mn = 0xFFFFFFFFU;
+        for (i = 0U; i < BUFFER_SIZE; i++) {
+            if (pbuf_ir[i] > mx) mx = pbuf_ir[i];
+            if (pbuf_ir[i] < mn) mn = pbuf_ir[i];
+        }
+        if (dc > 0U) {
+            float p = (float)(mx - mn) * 100.0f / (float)dc;
+            if (p > 20.0f) p = 20.0f;
+            pi_val = (pi_val > 0.01f) ? (pi_val * 0.7f + p * 0.3f) : p;
+        }
+    }
+
+    /* 滑掉 1 秒(50 样本), 1Hz 刷新 */
+    for (i = 0U; i < (uint16_t)(BUFFER_SIZE - 50); i++) {
+        pbuf_ir[i]  = pbuf_ir[i + 50U];
+        pbuf_red[i] = pbuf_red[i + 50U];
+    }
+    pbuf_cnt = (uint16_t)(BUFFER_SIZE - 50);
+}
+
+static void calc_spo2(void)
+{
+    static uint32_t red_v[100], ir_v[100];
+    static float spo2_s = 0.0f, pr_s = 0.0f;
+    static uint8_t spo2_n = 0U, pr_n = 0U;
+    uint32_t sum_r = 0U, sum_ir = 0U, min_ir = 0xFFFFFFFFU, max_ir = 0U, amp;
+    float acc_r = 0.0f, acc_ir = 0.0f;
+    float dc_r, dc_ir, ac_r, ac_ir, R;
+    uint8_t i, idx, st, have, last_peak;
+    uint32_t thr_hi, thr_lo;
+
+    /* 环形缓冲必须按时间顺序遍历: buf_idx 指向下一次写入位置, 也就是最旧的样本。
+       若按 ir_buf[0..99] 的索引顺序读, 波形是断裂的, 过零检测会失效。 */
+    idx = buf_idx;
+    for (i = 0U; i < 100U; i++) {
+        red_v[i] = red_buf[idx];
+        ir_v[i]  = ir_buf[idx];
+        sum_r  += red_v[i];
+        sum_ir += ir_v[i];
+        if (ir_v[i] > max_ir) max_ir = ir_v[i];
+        if (ir_v[i] < min_ir) min_ir = ir_v[i];
+        idx = (uint8_t)((idx + 1U) % 100U);
+    }
+
+    dc_r  = (float)sum_r / 100.0f;
+    dc_ir = (float)sum_ir / 100.0f;
+    if (dc_r < 8000.0f || dc_ir < 8000.0f) { clear_vitals(); spo2_n = 0U; pr_n = 0U; return; }
+    /* 空载时 IR 只有 1200~3400(环境光; 单开 25mA 自检也只有 5100), 真实按压 1.2e5 以上;
+       dc 低于 8000 一律判为没手指, 不再拿环境噪声/自检电流算出血氧、脉率。 */
+
+    /* AC 用均方根, 不用 max-min: 单个噪声尖峰会把 max-min 撑大到失真, 血氧就会乱跳 */
+    for (i = 0U; i < 100U; i++) {
+        float dr = (float)red_v[i] - dc_r;
+        float di = (float)ir_v[i]  - dc_ir;
+        acc_r  += dr * dr;
+        acc_ir += di * di;
+    }
+    ac_r  = fsqrt(acc_r / 100.0f);
+    ac_ir = fsqrt(acc_ir / 100.0f);
+    if (ac_ir < 8.0f) { clear_vitals(); spo2_n = 0U; pr_n = 0U; return; }
+
+    R = (ac_r / dc_r) / (ac_ir / dc_ir);
+    {
+        float raw = 110.0f - 25.0f * R;
+        if (raw > 100.0f) raw = 100.0f;
+        if (raw < 70.0f)  raw = 70.0f;
+        if (spo2_n == 0U) { spo2_s = raw; spo2_n = 1U; }
+        else              spo2_s = spo2_s * 0.7f + raw * 0.3f;   /* 平滑, 抑制逐帧抖动 */
+        spo2_val = spo2_s;
+    }
+
+    pi_val = (ac_ir / dc_ir) * 100.0f;
+    if (pi_val > 20.0f) pi_val = 20.0f;
+
+    /* 脉率: 双阈值 + 不应期上升沿检测, 取多个峰间距的中位数换算 bpm。
+       用中位数而不是平均: 窗口只有 2 秒(100 样本@50Hz), 单个误检峰会把平均值带飞。 */
+    amp = max_ir - min_ir;
+    if (amp < 20U) { pr_val = 0.0f; pr_n = 0U; }
+    else {
+        uint8_t iv[4];
+        uint8_t ivn = 0U;
+        thr_hi = min_ir + (amp * 13U) / 20U;   /* 65% 高位: 必须真的越过波峰才算 */
+        thr_lo = min_ir + (amp * 7U) / 20U;    /* 35% 低位: 回落到这里才重新武装 */
+        st = (ir_v[0] > thr_hi) ? 1U : 0U;
+        have = 0U;
+        last_peak = 0U;
+        for (i = 1U; i < 100U; i++) {
+            if (st == 0U && ir_v[i] > thr_hi) {
+                st = 1U;
+                if (have == 0U) { have = 1U; last_peak = i; }
+                else if ((uint8_t)(i - last_peak) >= 20U) {      /* 不应期 400ms => 上限 150bpm */
+                    if (ivn < 4U) iv[ivn++] = (uint8_t)(i - last_peak);
+                    last_peak = i;
+                }
+            } else if (st == 1U && ir_v[i] < thr_lo) {
+                st = 0U;
+            }
+        }
+        if (ivn > 0U) {
+            uint8_t a, b, t, spread;
+            for (a = 0U; a + 1U < ivn; a++) {                    /* 插入排序, 求中位 */
+                for (b = 0U; b + 1U < ivn - a; b++) {
+                    if (iv[b] > iv[b + 1U]) { t = iv[b]; iv[b] = iv[b + 1U]; iv[b + 1U] = t; }
+                }
+            }
+            t = (ivn & 1U) ? iv[ivn / 2U] : (uint8_t)((iv[ivn / 2U - 1U] + iv[ivn / 2U]) / 2U);
+            spread = iv[ivn - 1U] - iv[0U];
+            if (ivn >= 2U && (uint16_t)spread * 5U > (uint16_t)t) {
+                /* 各拍间距相对中位数的离散超过 20% => 节律不稳(多半是噪声/手指晃动), 本轮不采信 */
+                ivn = 0U;
+            }
+            if (ivn > 0U) {
+                float raw = 3000.0f / (float)t;                  /* 50Hz: bpm = 60*50/间隔 */
+                if (raw >= 45.0f && raw <= 150.0f) {
+                    if (pr_n == 0U) { pr_s = raw; pr_n = 1U; }
+                    else if (raw > pr_s * 1.45f + 10.0f || raw < pr_s * 0.72f - 10.0f) {
+                        /* 与当前值差太远, 判为误检, 只做小幅牵引, 避免断崖跳变 */
+                        pr_s = pr_s * 0.9f + raw * 0.1f;
+                    } else {
+                        pr_s = pr_s * 0.7f + raw * 0.3f;
+                    }
+                    pr_val = pr_s;
+                }
+            }
+        } else if (have == 0U) {
+            pr_val = 0.0f;                                        /* 一个峰都没有 = 没手指 */
+            pr_n = 0U;
+        }
+    }
+
+    spo2_valid = 1U;
+}
+
+static void calc_angles(void)
+{
+    float ax = (float)acc_x, ay = (float)acc_y, az = (float)acc_z;
+    float mag = (float)isqrt32((int32_t)(ay * ay + az * az));
+    if (mag > 1.0f) {
+        pitch_val = (-ax / mag) * 57.3f;
+        if (pitch_val > 90.0f) pitch_val = 90.0f;
+        if (pitch_val < -90.0f) pitch_val = -90.0f;
+    }
+    mag = (float)isqrt32((int32_t)(ax * ax + az * az));
+    if (mag > 1.0f) {
+        roll_val = (ay / mag) * 57.3f;
+        if (roll_val > 90.0f) roll_val = 90.0f;
+        if (roll_val < -90.0f) roll_val = -90.0f;
+    }
+}
+
+/* ==================== 跌倒检测（三段式） ==================== */
+typedef enum {
+    FALL_IDLE = 0,
+    FALL_FREEFALL,
+    FALL_IMPACT,
+    FALL_FALLEN,
+    FALL_ALARM
+} fall_state_t;
+
+static fall_state_t fall_state;
+static uint16_t fall_timer;
+static uint8_t fall_event;
+
+#define FALL_FREE_G     0.60f
+#define FALL_IMPACT_G   2.50f
+#define FALL_ANGLE_DEG  60.0f
+#define FALL_FREE_MIN   3U
+#define FALL_FREE_WIN   100U
+#define FALL_ANGLE_WIN  200U
+#define FALL_CONFIRM    300U
+
+static void fall_update(void)
+{
+    float ax = (float)acc_x, ay = (float)acc_y, az = (float)acc_z;
+    float g = (float)isqrt32((int32_t)(ax * ax + ay * ay + az * az)) / 16384.0f;
+    uint8_t tilted = (pitch_val > FALL_ANGLE_DEG || pitch_val < -FALL_ANGLE_DEG ||
+                      roll_val  > FALL_ANGLE_DEG || roll_val  < -FALL_ANGLE_DEG);
+
+    fall_event = 0U;
+
+    switch (fall_state) {
+    case FALL_IDLE:
+        if (g < FALL_FREE_G) { fall_state = FALL_FREEFALL; fall_timer = 0U; }
+        break;
+
+    case FALL_FREEFALL:
+        fall_timer++;
+        if (g > FALL_IMPACT_G) {
+            fall_state = FALL_IMPACT;
+            fall_timer = 0U;
+        } else if (g > FALL_FREE_G && fall_timer < FALL_FREE_MIN) {
+            fall_state = FALL_IDLE;
+        }
+        if (fall_timer > FALL_FREE_WIN) fall_state = FALL_IDLE;
+        break;
+
+    case FALL_IMPACT:
+        fall_timer++;
+        if (tilted) { fall_state = FALL_FALLEN; fall_timer = 0U; }
+        else if (fall_timer > FALL_ANGLE_WIN) fall_state = FALL_IDLE;
+        break;
+
+    case FALL_FALLEN:
+        fall_timer++;
+        if (fall_timer > FALL_CONFIRM) {
+            fall_state = FALL_ALARM;
+            fall_timer = 0U;
+            fall_event = 1U;
+            BEEP_ON();
+        } else if (!tilted && g > 0.8f && g < 1.2f) {
+            fall_state = FALL_IDLE;
+        }
+        break;
+
+    case FALL_ALARM:
+        if (fall_timer < 60000U) fall_timer++;
+        break;
+    }
+}
+
+static void fall_clear_alarm(void)
+{
+    BEEP_OFF();
+    fall_state = FALL_IDLE;
+    fall_timer = 0U;
+}
+
+static void fall_manual_trigger(void)
+{
+    fall_state = FALL_ALARM;
+    fall_timer = 0U;
+    fall_event = 1U;
+    BEEP_ON();
+}
+
+static const char *fall_state_str(void)
+{
+    switch (fall_state) {
+    case FALL_FREEFALL: return "FREE";
+    case FALL_IMPACT:   return "HIT";
+    case FALL_FALLEN:   return "FALLEN";
+    case FALL_ALARM:    return "ALARM";
+    default:            return "OK";
+    }
+}
+
+/* ==================== 按键 ==================== */
+#define KEY_NUM  4U
+static uint8_t  key_prev[KEY_NUM];
+static uint16_t key_hold[KEY_NUM];
+
+/* 0=无事件  1=短按(松开)  2=长按(2s 触发一次) */
+static uint8_t key_poll(uint8_t idx, uint8_t down)
+{
+    uint8_t ev = 0U;
+
+    if (down) {
+        if (key_hold[idx] < 60000U) key_hold[idx] += 10U;
+        if (key_prev[idx] && key_hold[idx] == 200U) ev = 2U;
+    } else {
+        if (key_prev[idx] && key_hold[idx] >= 20U && key_hold[idx] < 200U) ev = 1U;
+        key_hold[idx] = 0U;
+    }
+    key_prev[idx] = down;
+    return ev;
+}
+
+/* ==================== UART ==================== */
+static void uart_init(void)
+{
+    RCC_APB1ENR |= (1U << 17);
+    /* 实测: 本 JDY-31 的实际 UART 速率约 8660 baud(比标称 9600 慢约 10%),
+       直接用 9600 收发全是乱码。这里按实测比例校准: 36MHz 下 36000000/8490=4240 */
+    USART2_BRR = (g_pclk1_khz * 1000U) / 8490U;      /* 36MHz→4240, 8MHz→942 */
+    USART2_CR1 = (1U << 13) | (1U << 3) | (1U << 2);
+}
+
+static void uart_set_baud(uint32_t baud)
+{
+    USART2_BRR = (g_pclk1_khz * 1000U) / baud;
+}
+
+static void uart_send_str(const char *str)
+{
+#if UART_MUTE
+    return;
+#endif
+    while (*str) {
+        uint32_t guard = 0U;
+        while ((USART2_SR & (1U << 7)) == 0U) { if (++guard > 200000U) return; }
+        USART2_DR = (uint8_t)*str++;
+    }
+}
+
+static uint8_t uart_read_timeout(uint8_t *buf, uint8_t max, uint32_t ms)
+{
+    uint8_t n = 0U;
+    uint32_t idle = 0U;
+    /* 紧凑轮询次数与主频成正比: 8MHz 下每 ms 约 900 次, 72MHz 下约 8100 次 */
+    uint32_t idle_limit = ms * 900U * (g_hclk_khz / 8000U);
+
+    while (n < max) {
+        if (USART2_SR & (1U << 5)) {              /* RXNE 就绪 */
+            buf[n++] = (uint8_t)USART2_DR;        /* 读 DR 同时清 ORE */
+            idle = 0U;
+        } else {
+            if (++idle > idle_limit) break;
+        }
+    }
+    return n;
+}
+
+static uint8_t mem_contains(const uint8_t *buf, uint8_t n, const char *pat)
+{
+    uint8_t plen = 0U, i, j;
+    while (pat[plen]) plen++;
+    if (plen == 0U || n < plen) return 0U;
+    for (i = 0U; (uint8_t)(i + plen) <= n; i++) {
+        for (j = 0U; j < plen; j++) {
+            if (buf[i + j] != (uint8_t)pat[j]) break;
+        }
+        if (j == plen) return 1U;
+    }
+    return 0U;
+}
+
+static void uart_send(const uint8_t *buf, uint16_t n)
+{
+#if UART_MUTE
+    (void)buf; (void)n;
+    return;
+#endif
+    uint16_t i;
+    uint32_t guard;
+    for (i = 0U; i < n; i++) {
+        guard = 0U;
+        while ((USART2_SR & (1U << 7)) == 0U) { if (++guard > 200000U) return; }
+        USART2_DR = buf[i];
+    }
+}
+
+static void proto_send(uint8_t type, const uint8_t *payload, uint8_t len)
+{
+    uint8_t frame[32];
+    uint8_t i, sum = 0U;
+    if (len > 26U) return;
+    frame[0] = 0xAAU; frame[1] = 0x55U; frame[2] = type; frame[3] = len;
+    for (i = 0U; i < len; i++) frame[4U + i] = payload[i];
+    for (i = 0U; i < (uint8_t)(4U + len); i++) sum = (uint8_t)(sum + frame[i]);
+    frame[4U + len] = sum;
+    uart_send(frame, (uint16_t)(5U + len));
+}
+
+static void send_data_frame(void)
+{
+    uint8_t p[6];
+    p[0] = (uint8_t)(spo2_val + 0.5f);
+    p[1] = (uint8_t)(pr_val + 0.5f);
+    p[2] = (uint8_t)(pi_val * 10.0f + 0.5f);
+    p[3] = (uint8_t)(pitch_val + 90.0f);
+    p[4] = (uint8_t)(roll_val + 90.0f);
+    p[5] = (uint8_t)fall_state;
+    proto_send(0x01U, p, 6U);
+}
+
+/* 波形帧: AA 55 03 0C | ir0[3] red0[3] ir1[3] red1[3] | sum */
+static void send_wave_frame(void)
+{
+    uint8_t p[12];
+    uint32_t v;
+    uint8_t k;
+
+    dbg_tx++;
+
+    for (k = 0U; k < 2U; k++) {
+        v = wave_ir[k];
+        p[k * 6U + 0U] = (uint8_t)((v >> 16) & 0x03U);
+        p[k * 6U + 1U] = (uint8_t)(v >> 8);
+        p[k * 6U + 2U] = (uint8_t)v;
+
+        v = wave_red[k];
+        p[k * 6U + 3U] = (uint8_t)((v >> 16) & 0x03U);
+        p[k * 6U + 4U] = (uint8_t)(v >> 8);
+        p[k * 6U + 5U] = (uint8_t)v;
+    }
+
+    proto_send(0x03U, p, 12U);
+    wave_cnt = 0U;
+}
+
+/* ==================== JDY-31 AT 配置 ==================== */
+static uint8_t at_diag_buf[24];
+static uint8_t at_diag_len;
+static uint8_t at_try_idx;
+static uint8_t at_found_baud = 0xFFU;   /* 扫描到的波特率索引, 0xFF=未找到 */
+
+static void at_record(const uint8_t *buf, uint8_t n, uint8_t attempt)
+{
+    uint8_t i;
+    at_try_idx = attempt;
+    at_diag_len = (n > (uint8_t)sizeof(at_diag_buf)) ? (uint8_t)sizeof(at_diag_buf) : n;
+    for (i = 0U; i < at_diag_len; i++) at_diag_buf[i] = buf[i];
+}
+
+/* 返回: 0=失败/无响应  1=本次改成 19200 成功  2=本来就是 19200  3=写入存疑 */
+static uint8_t jdy_at_configure(void)
+{
+    /* 先扫描模块当前波特率, 再统一设成 19200。
+       该模块不持久化设置, 且烧录时不一定断电, 所以必须扫描。 */
+    static const uint32_t bauds[5] = { 9600U, 19200U, 38400U, 57600U, 115200U };
+    uint8_t buf[40];
+    uint8_t n;
+    uint8_t bi;
+    uint8_t found = 0xFFU;
+
+    for (bi = 0U; bi < 5U; bi++) {
+        uart_set_baud(bauds[bi]);
+        delay_ms(350U);
+        uart_send_str("AT+BAUD\r\n");
+        n = uart_read_timeout(buf, sizeof(buf), 400U);
+        at_record(buf, n, bi);
+        if (n > 0U) { found = bi; break; }
+    }
+
+    if (found == 0xFFU) return 0U;      /* 全静默 */
+    if (found == 1U)   return 2U;       /* 已经是 19200 */
+
+    /* 设成 19200 */
+    uart_send_str("AT+BAUD4\r\n");
+    delay_ms(500U);
+
+    uart_set_baud(19200U);
+    delay_ms(300U);
+    uart_send_str("AT+BAUD\r\n");
+    n = uart_read_timeout(buf, sizeof(buf), 400U);
+    at_record(buf, n, 9U);
+    if (n > 0U) return 1U;
+
+    /* 失败, 退回找到的那档继续运行 */
+    uart_set_baud(bauds[found]);
+    return 3U;
+}
+
+/* ==================== 显示 ==================== */
+static char line_buf[24];
+
+static void fmt_u(char *dst, uint16_t v, uint8_t width)
+{
+    char tmp[6];
+    uint8_t n = 0U, i;
+    if (v == 0U) tmp[n++] = '0';
+    while (v > 0U && n < 6U) { tmp[n++] = (char)('0' + (v % 10U)); v /= 10U; }
+    while (n < width && n < 6U) tmp[n++] = ' ';
+    for (i = 0U; i < n; i++) dst[i] = tmp[n - 1U - i];
+    dst[n] = '\0';
+}
+
+static void fmt_s(char *dst, int16_t v, uint8_t width)
+{
+    char tmp[7];
+    uint8_t n = 0U, i;
+    uint16_t u = (v < 0) ? (uint16_t)(-v) : (uint16_t)v;
+    if (u == 0U) tmp[n++] = '0';
+    while (u > 0U && n < 6U) { tmp[n++] = (char)('0' + (u % 10U)); u /= 10U; }
+    if (v < 0) tmp[n++] = '-';
+    while (n < width && n < 7U) tmp[n++] = ' ';
+    for (i = 0U; i < n; i++) dst[i] = tmp[n - 1U - i];
+    dst[n] = '\0';
+}
+
+static void draw_page_main(void)
+{
+    char t[10];
+
+    draw_str(0U, 0U, "PPG v5");
+    draw_str(48U, 0U, measure_on ? "MEAS" : "STOP");
+    draw_str(96U, 0U, "1/3");
+    /* 心跳点: 右上角每秒 o/. 交替。闪 = 屏在刷新; 不闪 = 屏真冻住了, 一眼区分 */
+    draw_char(120U, 0U, ((now_ms() / 1000U) & 1U) ? 'o' : '.');
+
+    if (spo2_valid) {
+        draw_str(0U, 2U, "SpO2");
+        fmt_u(line_buf, (uint16_t)(spo2_val + 0.5f), 3U);
+        draw_str(40U, 2U, line_buf);
+        draw_str(64U, 2U, "%");
+    } else {
+        draw_str(0U, 2U, "SpO2 --");
+    }
+
+    if (spo2_valid && pr_val >= 45.0f) {
+        draw_str(0U, 4U, "PR");
+        fmt_u(line_buf, (uint16_t)(pr_val + 0.5f), 3U);
+        draw_str(24U, 4U, line_buf);
+        draw_str(56U, 4U, "bpm");
+        if (pr_ac_used) draw_str(84U, 4U, "[AC]");   /* 本窗 PR 来自自相关兜底 */
+    } else if (spo2_valid) {
+        draw_str(0U, 4U, "PR --");
+    } else if (max_present) {
+        draw_str(0U, 4U, "PRESS FINGER");
+    } else {
+        draw_str(0U, 4U, "-- no sensor --");
+    }
+
+    if (!spo2_valid && max_present) {
+        /* 没手指时也要有活数据可看: 直接显示 IR/RED 原始值(千为单位),
+           这样一眼就知道模块在正常采样, 而不是"屏幕死了"。 */
+        uint16_t irk = (uint16_t)(max_ir_raw / 1000U);
+        uint16_t rdk = (uint16_t)(max_red_raw / 1000U);
+        if (irk > 999U) irk = 999U;
+        if (rdk > 999U) rdk = 999U;
+        draw_str(0U, 6U, "IR");
+        fmt_u(t, irk, 3U);
+        draw_str(16U, 6U, t);
+        draw_str(40U, 6U, "K");
+        draw_str(56U, 6U, "RD");
+        fmt_u(t, rdk, 3U);
+        draw_str(72U, 6U, t);
+        draw_str(96U, 6U, "K");
+    } else {
+        draw_str(0U, 6U, "P");
+        fmt_s(t, (int16_t)pitch_val, 4U);
+        draw_str(8U, 6U, t);
+        draw_str(48U, 6U, "R");
+        fmt_s(t, (int16_t)roll_val, 4U);
+        draw_str(56U, 6U, t);
+        draw_str(96U, 6U, fall_state_str());
+    }
+}
+
+static void draw_page_imu(void)
+{
+    char t[10];
+
+    draw_str(0U, 0U, "IMU MPU6050");
+    draw_str(96U, 0U, "2/3");
+
+    draw_str(0U, 2U, "Pitch");
+    fmt_s(t, (int16_t)pitch_val, 4U);
+    draw_str(48U, 2U, t);
+    draw_str(80U, 2U, "deg");
+
+    draw_str(0U, 4U, "Roll ");
+    fmt_s(t, (int16_t)roll_val, 4U);
+    draw_str(48U, 4U, t);
+    draw_str(80U, 4U, "deg");
+
+    draw_str(0U, 6U, "State:");
+    draw_str(56U, 6U, fall_state_str());
+    draw_str(104U, 6U, mpu_present ? "ON" : "--");
+}
+
+static void fmt_hex(char *dst, uint8_t v)
+{
+    uint8_t i, nib;
+    dst[0] = '0'; dst[1] = 'x';
+    for (i = 0U; i < 2U; i++) {
+        nib = (uint8_t)((v >> ((1U - i) * 4U)) & 0x0FU);
+        dst[2U + i] = (char)((nib < 10U) ? ('0' + nib) : ('A' + nib - 10U));
+    }
+    dst[4] = '\0';
+}
+
+static void draw_page_sys(void)
+{
+    oled_clear();
+
+    draw_str(0U, 0U, "SYSTEM");
+    draw_str(96U, 0U, "3/3");
+
+    draw_str(0U, 2U, "OLED: ");
+    draw_str(64U, 2U, oled_present ? "OK" : "--");
+
+    draw_str(0U, 4U, "MPU : ");
+    draw_str(64U, 4U, mpu_present ? "OK" : "--");
+
+    draw_str(0U, 6U, "MAX : ");
+    draw_str(64U, 6U, max_present ? "OK" : "--");
+}
+
+
+
+static void draw_screen(void)
+{
+    oled_clear();
+    if (page_idx == 0U)      draw_page_main();
+    else if (page_idx == 1U) draw_page_imu();
+    else                     draw_page_sys();
+    oled_flush_begin();            /* 只置标志, 由主循环每圈写一页 */
+}
+
+/* ==================== 主函数 ==================== */
+int main(void)
+{
+    uint8_t r, i;
+
+    clock_init();                 /* 先定主频(72MHz 或退回 8MHz), 后面外设按它换算 */
+    tick_start();                 /* 毫秒时钟必须在任何 delay_ms 之前启动 */
+    gpio_init();
+    i2c_init(&bus1);
+    i2c_init(&bus2);
+    uart_init();
+
+    delay_ms(400U);     /* 等 OLED 与 JDY-31 电源稳定 */
+
+    /* ---- OLED 初始化: 上电抖动会导致首写丢 ACK, 重试几次并重配总线 ---- */
+    oled_present = 0U;
+    {
+        uint8_t a;
+        for (a = 0U; a < 6U; a++) {
+            dbg_oled = (uint32_t)(a + 1U);
+            if (a != 0U) delay_ms(60U);
+            r = i2c_write(&bus1, OLED_ADDR, oled_init_seq, (uint16_t)sizeof(oled_init_seq));
+            if (r == 0U) { oled_present = 1U; break; }
+            r = i2c_write(&bus1, OLED_ADDR | 0x02U, oled_init_seq, (uint16_t)sizeof(oled_init_seq));
+            if (r == 0U) { oled_present = 1U; break; }
+            i2c_init(&bus1);            /* 清掉可能卡住的 BUSY/ADDR 状态再试 */
+        }
+    }
+
+    delay_ms(300U);
+
+    if (oled_present) {
+        oled_clear();
+        draw_str(0U, 0U, "PPG v5 boot");
+        draw_str(0U, 2U, "scan I2C1/2");
+        oled_flush_blocking();
+    }
+
+    for (i = 0U; i < 100U; i++) { red_buf[i] = 0U; ir_buf[i] = 0U; }
+    buf_idx = 0U;
+
+    mpu_present = (mpu_init() == 0U) ? 1U : 0U;
+    max_present = (max_init() == 0U) ? 1U : 0U;
+
+    /* 调试结果字(供 SWD 直读): [31:24]=0x5A [23:16]=bus [15:8]=ID [7]=oled [0]=ack1 */
+    dbg_rep = 0x5A000000U | ((uint32_t)max_bus_no << 16) | ((uint32_t)max_id1 << 8)
+            | ((uint32_t)(oled_present ? 1U : 0U) << 1) | (uint32_t)(max_ack1 & 1U);
+
+    /* 诊断扫描已移除: 保持最小启动流程, 避免 I2C2 挂死 */
+
+    if (oled_present) {
+        char t[8];
+        oled_clear();
+        draw_str(0U, 0U, "MAX30102 TEST");
+
+        draw_str(0U, 2U, "I2C2:");
+        draw_str(48U, 2U, max_ack1 == 0U ? "ACK" : "--");
+        draw_str(72U, 2U, "ID");
+        fmt_hex(t, max_id1);
+        draw_str(88U, 2U, t);
+
+        draw_str(0U, 4U, "SCL:PB10 SDA:PB11");
+
+        if (max_bus_no == 1U)            draw_str(0U, 6U, "USE I2C2 -> OK");
+        else if (max_bus_no >= 11U)      draw_str(0U, 6U, "USE SOFT -> OK");
+        else if (max_bus_no == 2U)       draw_str(0U, 6U, "USE I2C1 -> OK");
+        else                             draw_str(0U, 6U, "NO SENSOR FOUND");
+        oled_flush_blocking();
+    }
+    delay_ms(2000U);
+    led_probe();                       /* 上电自检: 单路 LED 满电流看能否出光 */
+
+    fall_state = FALL_IDLE;
+    fall_timer = 0U;
+    page_idx = 0U;      /* 开机显示主界面 */
+    measure_on = 1U;
+
+    uint32_t now, t_wave = 0U, t_data = 0U, t_disp = 0U;
+
+    while (1) {
+        uint8_t e;
+
+        dbg_cnt++;                       /* 心跳: 供 ST-Link 确认固件在跑 */
+#if UART_MUTE
+        /* 用测出的"模块真实位时长 vs 本机位时长"比例校准波特率:
+           本机 BRR=3750 时位时长 7351 周期, 模块位时长 8312 周期 -> BRR 应乘 1.1308
+           36000000/8490 = 4240 (对应模块实际约 8660 baud) */
+        {
+            static uint32_t t_c = 0U, t_s = 0U;
+            uint32_t tn = now_ms();
+            if (t_c == 0U) { t_c = tn; uart_set_baud(8490U); }
+            if ((tn - t_s) >= 10U) {
+                uint32_t g = 0U;
+                t_s = tn;
+                while ((USART2_SR & (1U << 7)) == 0U) { if (++g > 200000U) break; }
+                USART2_DR = 0x55U;
+                dbg_tx++;
+            }
+        }
+#endif
+        /* ---- 按键 ---- */
+        e = key_poll(0U, KEY1_DOWN());
+        if (e == 1U) measure_on = measure_on ? 0U : 1U;
+
+        e = key_poll(1U, KEY2_DOWN());
+        if (e == 1U) page_idx = (uint8_t)((page_idx + 1U) % 3U);
+
+        e = key_poll(2U, KEY3_DOWN());
+        if (e == 1U && fall_state == FALL_ALARM) fall_clear_alarm();
+
+        e = key_poll(3U, KEY4_DOWN());
+        if (e == 2U) fall_manual_trigger();
+
+        /* ---- 报警时蜂鸣器 2Hz 间歇 ---- */
+        if (fall_state == FALL_ALARM) {
+            if (((fall_timer / 25U) & 1U) == 0U) BEEP_ON();
+            else                                 BEEP_OFF();
+        }
+
+        /* ---- 传感器 ---- */
+        if (mpu_present) {
+            if (mpu_read() == 0U) {
+                calc_angles();
+                fall_update();
+                if (fall_event) {
+                    uint8_t ev = 1U;
+                    proto_send(0x02U, &ev, 1U);
+                }
+            }
+        }
+        if (max_present && measure_on) (void)max_read_fifo();
+
+        oled_flush_step();                              /* 每圈只写一页, 不再整帧阻塞 190ms */
+
+        /* ---- 全部按真实时间节拍, 不受主循环被刷屏拖慢影响 ---- */
+        now = now_ms();
+        if ((now - t_wave) >= 40U) {                    /* 波形帧 25Hz */
+            t_wave = now;
+            if (max_present && wave_cnt >= 2U) send_wave_frame();
+        }
+        if ((now - t_data) >= 1000U) {                  /* 每秒算一次血氧并上报 */
+            t_data = now;
+            if (max_present && measure_on) ppg_algo_run();   /* Maxim 官方算法, 4 秒窗口 1Hz 刷新 */
+            send_data_frame();
+            dbg_ping1 = (uint32_t)i2c_ping(&bus1, OLED_ADDR);
+            oled_health();                               /* 屏掉 ACK 就自动重建总线+重初始化 */
+            max_health_check();                          /* 每秒校验芯片配置, 掉回默认就重配 */
+        }
+        if (!flush_busy && (now - t_disp) >= 250U) {     /* 上一帧写完才允许重画, 4Hz */
+            t_disp = now;
+            draw_screen();                              /* 只装填缓冲 + 启动分页发送 */
+            LED_ON();
+        } else {
+            LED_OFF();
+        }
+
+        delay_ms(5U);
+    }
+}
