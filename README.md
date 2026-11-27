@@ -1,12 +1,18 @@
 # STM32 + MAX30102 血氧/脉率监测系统
 
-> 基于 STM32F103C8T6（Blue Pill）的指夹式 PPG 采集与算法验证平台：裸机固件完成 SpO2 / 脉率 / 灌注指数计算与跌倒检测，数据通过串口与蓝牙同步到电脑和手机。
+> 基于 STM32F103C8T6（Blue Pill）的指夹式 PPG 采集与算法验证平台：裸机固件完成 SpO2、脉率、灌注指数计算和跌倒检测，通过串口/蓝牙同步到电脑、手机网页与 Android App。
 
-课程设计项目。重点不在"能测"，而在**脉率判据怎么从不准做到准**——五轮算法迭代的过程、失败判据和实测数据都完整保留在仓库里。
+课程设计项目。重点不只是“能测”，而是把脉率判据从不稳做到可用：五轮算法迭代、失败判据、4 页 OLED 设置页和实测数据都保留在仓库里。
 
 ![系统框图](docs/system-architecture.png)
 
----
+## 当前版本（2026-11-27）
+
+- 固件：`02_固件/LED_Blink.hex`，86,760 B，SHA256 `90BCFB251F59D246E19B0F2DD48DB70CF8826A406729B7636013EEF3E16080B6`
+- 固件源码：`02_固件/main.c`，125,865 B；`02_固件/CubeIDE工程` 可直接导入重建
+- 上位机：`03_上位机/ppg_monitor.py`（PyQt5）与 `03_上位机/web_monitor.py`（零依赖网页版）
+- Android：`06_Android手机端App/血氧监测.apk`，v3 记录页版本，542,107 B，SHA256 `3836801A42C4876AFC7AE7EE0FB081B0B7CDA21B33A3B127A64A9D5B9985C31A`
+- 硬件：转接板 v6，设计文件与 Gerber 见 `05_设计资料/PCB工程_v6/`
 
 ## 硬件
 
@@ -18,37 +24,43 @@
 | 显示屏 | SH1106 128×64 OLED | I2C1，地址 `0x3C` |
 | 蓝牙 | JDY-31（SPP） | USART2，9600 8N1 |
 | 蜂鸣器 | 无源，4 kHz | TIM1_CH1N |
-| 转接板 | 自绘 v5（立创 EDA 专业版） | — |
+| 转接板 | 自绘 v6（约 100×60 mm，Type-C 供电） | — |
 
 固件引脚分配：
 
-```
+```text
 I2C1   PB6/PB7   → OLED SH1106 (0x3C) + MPU6050 (0x68)
 I2C2   PB10/PB11 → MAX30102 (0x57)
 USART2 PA2/PA3   → JDY-31 (9600)
-BEEP   PB13        LED PC13
+BEEP   PB13       LED PC13
 KEY1-4 PB1 / PA6 / PA8 / PB15
 ```
 
-## 硬件设计
+### 硬件设计
 
-转接板由本人在立创 EDA（专业版）自绘，v5 为最终实物版本。工程文件可直接导入打开：[`PPG_STM32转接板_v5_回退.zip`](05_设计资料/PCB工程/PPG_STM32转接板_v5_回退.zip)（内含 `.epru` 工程数据，解压后由嘉立创 EDA 导入即可编辑原理图与 PCB）。
+转接板为立创 EDA 自绘。v6 修正了 S1–S4 按键接线与 J3（MPU6050）接口，并加入 Type-C 供电；18650 充放一体模块和电量 ADC 仍未接入，列入后续计划。
 
-| 原理图 | PCB 布线 |
+- v6 可编辑工程：[`PPG_STM32转接板_v6.epro2`](05_设计资料/PCB工程_v6/PPG_STM32转接板_v6.epro2)
+- v6 Gerber 打板包：[`v6_gerber_打板定版.zip`](05_设计资料/PCB工程_v6/v6_gerber_打板定版.zip)
+- v6 BOM：[`v6_BOM.csv`](05_设计资料/PCB工程_v6/v6_BOM.csv)
+- v5 回退版保留在 [`05_设计资料/PCB工程`](05_设计资料/PCB工程)，用于对照
+
+| v6 原理图 | v6 PCB |
 |---|---|
-| ![](05_设计资料/PCB工程/原理图_v5_回退.png) | ![](05_设计资料/PCB工程/PCB布线_v5_回退.png) |
-
-v5 已知问题：板面未留外部供电入口，只能依赖 ST-Link 的 3.3 V 针供电，实测拔掉调试器即断电。v6 计划修正布局并补上电源接口，尚未打板。
+| ![](05_设计资料/PCB工程_v6/原理图_v6.png) | ![](05_设计资料/PCB工程_v6/PCB_v6.png) |
 
 ## 功能
 
-- **50 Hz 采样**，400 点滑动窗（8 s），每窗输出一次结果
+- **50 Hz 采样**，400 点滑动窗（8 s），每秒输出一次血氧/脉率/PI
 - **脉率**：自相关 lag 投票 + 频域主判据双路，按灌注指数 PI 自动切换
 - **血氧**：R 值查表，`SpO2 = 110 - 17R` 线性近似
 - **灌注指数 PI**：AC/DC 比，反映末梢灌注强弱
-- **跌倒检测**：MPU6050 三阶段判据——冲击 ≥ 2.2 g → 220 ms 内静止 0.65~1.35 g → 重力方向与竖直夹角 ≥ 63°，满足后蜂鸣器报警，10 s 自动复位
-- **OLED 三页轮播**：3 s 自动翻页；手指在位时锁定在测量页，拿开后恢复轮播
-- **三端显示**：PyQt5 电脑上位机、标准库 HTTP + SSE 手机网页、原生 Android APK
+- **跌倒检测**：MPU6050 冲击 → 静止 → 姿态角三阶段判据；跌倒报警 2 Hz，优先于心率报警
+- **心率区间报警**：第 4 页设置 Min/Max，越界时蜂鸣器 1 Hz 间歇报警；OLED 不显示报警状态
+- **4 页 OLED**：主界面 / IMU / 系统信息 / `4/4 SETTINGS`；S2 手动切页，S4 返回第 1 页，不自动轮播
+- **设置页**：S1/S2 调 Min/Max（短按 ±1，长按 ±5），S3 切换 Min/Max，S4 返回；默认 60/100，范围 30–220，Min/Max 至少差 5
+- **三端显示**：PyQt5 电脑上位机、标准库 HTTP + SSE 手机网页、原生 Android App
+- **Android v3**：本机 SQLite 记录页、血氧/脉率/PI/姿态、跌倒独立记录；脉率区间内绿色、越界红色
 
 ## 实测指标
 
@@ -68,91 +80,106 @@ v5 已知问题：板面未留外部供电入口，只能依赖 ST-Link 的 3.3 
 
 ## 目录
 
-```
-01_报告/              课设报告（定稿 + 两份过程稿，保留算法演进轨迹）
-02_固件/              main.c（裸机寄存器级，11-16 定型版）、LED_Blink.hex、烧录与调试文档
-  CubeIDE工程/        STM32CubeIDE 完整工程（内含 11-18 调试版源码，已验证可编译）
-  演进快照/           8 个开发过程的 .bak 备份
-  历史固件/           三版里程碑 hex
-03_上位机/            ppg_monitor.py（PyQt5 串口版）、web_monitor.py（零依赖 HTTP + SSE 网页版）
-04_验收数据/          采集 CSV、原始 400 点窗、可复跑的采集脚本
-05_设计资料/          PCB 工程（立创 EDA 源文件）、原理图与布线图、转接板交接文档、旧板验证报告
-   PCB工程/            v5 回退版工程 zip + 原理图 + PCB 布线图
-06_Android手机端App/  MainActivity.java、已构建 APK、使用说明
+```text
+01_报告/              课设报告（定稿 + 过程稿，保留算法演进轨迹）
+02_固件/              main.c、LED_Blink.hex、烧录与调试文档、版本更新_20261127.md
+  CubeIDE工程/        STM32CubeIDE 完整工程（最新 4 页设置版源码）
+  演进快照/           开发过程的源码备份
+  历史固件/           各阶段里程碑 hex
+03_上位机/            ppg_monitor.py（PyQt5）、web_monitor.py（HTTP + SSE）
+04_验收数据/          采集 CSV、原始 400 点窗、可复跑采集脚本
+05_设计资料/          v6 PCB 工程、Gerber、BOM、原理图/PCB 图、交接文档
+06_Android手机端App/  MainActivity.java、v3 APK、使用说明
+docs/                 README 用的系统框图
 ```
 
 算法怎么一步步改过来的，看 `01_报告/课设报告_MAX30102脉率判据五轮演进_定稿_20261116.md`。
 
+> 完整的 Word 课设报告含个人/学校信息，未纳入公开仓库；仓库内保留脱敏后的 Markdown 报告。
+
 ## 快速开始
 
-### 编译
+### 编译固件
 
 固件是裸机寄存器级实现（非 HAL），完整工程在 `02_固件/CubeIDE工程/`：
 
 1. STM32CubeIDE：`File → Import → General → Existing Projects into Workspace`，选中该目录
 2. `Project → Build`，产物在 `Debug/LED_Blink.elf` 与 `.hex`
 
-已用 CubeIDE 自带的 arm-none-eabi-gcc 14.2.1 做过全量重建验证：`text 28,980 B / data 104 B / bss 12,528 B`，无 error。有若干 unused-function 警告，属调试残留，不影响运行。
-
-> 注意：工程里是 11-18 调试版源码；`02_固件/main.c` 是 11-16 定型版，两者不同，详见 `02_固件/README.md`。
+也可直接使用已编译的 `02_固件/LED_Blink.hex`，不必自行编译。
 
 ### 烧录
 
 ```bash
-STM32_Programmer_CLI.exe -c port=SWD freq=1000 -w LED_Blink.hex -v -rst -run
+STM32_Programmer_CLI.exe -c port=SWD freq=1000 -w 02_固件/LED_Blink.hex -v -rst -run
 ```
 
-看到 `Download verified successfully` 即成功。也可以直接用 `02_固件/LED_Blink.hex`，无需自行编译。详细参数见 `02_固件/STM32板子烧录与调试配置文档.md`。
+看到 `Download verified successfully` 即成功。详细参数见 `02_固件/STM32板子烧录与调试配置文档.md`。
 
 ### 电脑上位机
 
 ```bash
-pip install -r requirements.txt
+pip install -r 03_上位机/requirements.txt
 python 03_上位机/ppg_monitor.py
 ```
 
-选串口（默认 `COM8`，请改成你的端口）、9600，点连接。
+选串口（代码默认 `COM8`，请改成你的端口）、9600，点连接。
 
-### 手机端
-
-两种方式：
-
-1. **网页版**：`python 03_上位机/web_monitor.py`，手机浏览器打开终端打印的地址，同一局域网即可；
-2. **APK**：安装 `06_Android手机端App/血氧监测.apk`，在系统蓝牙里配对 `JDY-31-SPP`（PIN `1234`），再在 App 内连接。
-
-### 采集数据
+### 手机网页版
 
 ```bash
-python 04_验收数据/_accept_long.py long3 240   # 4 分钟长采，按 PI 自动分档
+python 03_上位机/web_monitor.py
 ```
 
-脚本默认 `COM8`，运行前请关掉占用该串口的其他程序。
+手机浏览器打开终端打印的地址，保持同一局域网即可。
+
+### Android App
+
+1. 安装 `06_Android手机端App/血氧监测.apk`（Android 6.0+，debug 签名）
+2. 系统蓝牙配对 `JDY-31-SPP`（PIN `1234`）
+3. 回到 App 点右上角状态胶囊选择设备并连接
+4. 底部 `开始记录` 开启本机记录；顶部 `记录` 打开数据记录页
+
+> JDY-31 同一时刻只能连接一台主设备。手机连接前，电脑上位机必须先点“断开”。
 
 ## 通信协议
 
 串口 9600 8N1，帧格式：
 
-```
+```text
 AA 55 | type(1) | len(1) | payload(len) | checksum(1)
 checksum = 前 4+len 字节求和 & 0xFF
 ```
 
 | type | 含义 | payload |
 |---|---|---|
-| `0x01` | 测量结果，25 帧/s | len=6：SpO2 / PR / PI(×10) / pitch+90 / roll+90 / state |
+| `0x01` | 测量结果，1 Hz | len=6：SpO2 / PR / PI(×10) / pitch+90 / roll+90 / state |
 | `0x02` | 跌倒事件 | len=0 或 1 |
-| `0x03` | 原始波形 | len=6（IR×2）或 12（ir0/red0/ir1/red1，大端） |
+| `0x03` | 原始波形，25 Hz | len=6（IR×2）或 12（ir0/red0/ir1/red1，大端） |
+| `0x04` | 心率上下限，1 Hz | len=2：hr_min / hr_max |
 
 `state`：0 空闲、1 测量中、2 信号弱、4 跌倒。
 
+上位机收到 `0x04` 后把脉率按区间着色：区间内绿色、越界红色、无有效值灰色。Android v3 同样处理，并在记录页按每条记录保存时的区间着色。
+
+## Android v3 记录
+
+- 记录保存在 App 私有 SQLite 数据库 `ppg_records.db`，不再写 `Android/data/...` CSV
+- 顶部 `记录` 进入记录页；显示总条数、跌倒次数、当前 PR 正常区间
+- 每条显示时间、SpO₂、PR、PI、状态、姿态；跌倒事件单独红色卡片
+- 默认显示最近 300 条，最多保留 50,000 条；可刷新、清空
+- `0x04` 区间每秒同步；默认 60–100，可在第 4 页修改
+
 ## 已知限制
 
-1. 按键 S1–S4 因封装 1-2 / 3-4 共用短地而失效，当前靠 3 秒自动轮播绕过（v6 PCB 计划修正，见 `05_设计资料`）
-2. 板子布局导致无法 USB 供电，只能由 ST-Link 的 3.3V 针供电
+1. 按键 S1–S4 已在 v6 硬件上修正，但旧 v5 板仍存在按键共用短地问题
+2. v6 尚未接入 18650 充放模块与电量 ADC，移动供电需外部 Type-C
 3. 无运动伪差抑制，晃动时脉率会漂
 4. SpO2 未与医用血氧仪对照，仅有 PI/PR 的相对验证
 5. `pr_val` 在手指拿开后不会超时清零
-6. 历史固件与部分文档带有调试残留（warning 未清）
+6. Android APK 为 debug 签名，仅适合侧载测试，不适合应用商店
+7. Android v3 不导入旧 CSV；旧文件仍在手机原位置，但新 App 不读取
+8. 固件源码保留若干未调用诊断函数，编译会有 unused-function 警告
 
 ## 许可
 
@@ -170,6 +197,3 @@ MIT License，见 [LICENSE](LICENSE)。报告与数据同样可自由引用，�
 | 文档 | 课设报告结构、README、交接文档的撰写与整理 |
 
 原理图与 PCB 布线的设计决策、器件选型、实验方案与数据采集由作者本人完成。
-
-> GitHub 侧栏的 Contributors 按 commit 邮箱关联账号统计，AI 没有对应的 GitHub 账号，所以不会出现在那个头像列表里。这份声明是作者对协作方式的主动记录。
-

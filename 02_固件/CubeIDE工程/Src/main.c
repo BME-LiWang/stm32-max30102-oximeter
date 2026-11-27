@@ -315,22 +315,22 @@ static void i2c_bus_recover(i2c_bus_t *b)
         GPIOB_CRL &= ~(0xFFU << 24);
         GPIOB_CRL |=  (0x66U << 24);            /* PB6/PB7 开漏输出 2MHz */
         GPIOB_ODR |=  (1U << 7);                /* SDA 释放为高 */
-        for (i = 0U; i < 9U; i++) {
-            GPIOB_ODR &= ~(1U << 6); for (d = 0U; d < 40U; d++) { }
-            GPIOB_ODR |=  (1U << 6); for (d = 0U; d < 40U; d++) { }
+        for (i = 0U; i < 16U; i++) {            /* 9 个不够时补到 16 个, 给慢从机更多机会 */
+            GPIOB_ODR &= ~(1U << 6); for (d = 0U; d < 200U; d++) { }
+            GPIOB_ODR |=  (1U << 6); for (d = 0U; d < 200U; d++) { }
         }
-        GPIOB_ODR &= ~(1U << 7); for (d = 0U; d < 40U; d++) { }
+        GPIOB_ODR &= ~(1U << 7); for (d = 0U; d < 200U; d++) { }
         GPIOB_ODR |=  (1U << 7);                /* 补一个 STOP 条件 */
         GPIOB_CRL &= ~(0xFFU << 24); GPIOB_CRL |= (0xFFU << 24);  /* 切回 AF OD */
     } else {
         GPIOB_CRH &= ~(0xFFU << 8);
         GPIOB_CRH |=  (0x66U << 8);             /* PB10/PB11 开漏输出 2MHz */
         GPIOB_ODR |=  (1U << 11);
-        for (i = 0U; i < 9U; i++) {
-            GPIOB_ODR &= ~(1U << 10); for (d = 0U; d < 40U; d++) { }
-            GPIOB_ODR |=  (1U << 10); for (d = 0U; d < 40U; d++) { }
+        for (i = 0U; i < 16U; i++) {
+            GPIOB_ODR &= ~(1U << 10); for (d = 0U; d < 200U; d++) { }
+            GPIOB_ODR |=  (1U << 10); for (d = 0U; d < 200U; d++) { }
         }
-        GPIOB_ODR &= ~(1U << 11); for (d = 0U; d < 40U; d++) { }
+        GPIOB_ODR &= ~(1U << 11); for (d = 0U; d < 200U; d++) { }
         GPIOB_ODR |=  (1U << 11);
         GPIOB_CRH &= ~(0xFFU << 8); GPIOB_CRH |= (0xFFU << 8);
     }
@@ -447,12 +447,13 @@ static uint8_t i2c_read(i2c_bus_t *b, uint8_t addr, uint8_t reg, uint8_t *buf, u
     else         *b->CR1 |=  (1U << 10);
 
     for (i = 0U; i < n; i++) {
-        /* 关键顺序: ACK=0 与 STOP 都必须在"等到 RXNE"之前挂上。
-           原来的写法是等 RXNE 之后才置 STOP, 那时最后一个字节的 ACK 阶段已经过去,
-           STOP 生成不及时, 函数返回时总线仍处于 BUSY, 紧接着的下一次读就 START 超时。
-           症状: 读 WHO_AM_I 成功, 后面读加速度寄存器全部 rc=1。 */
-        if (i + 2U == n) *b->CR1 &= ~(1U << 10);
-        if (i + 1U == n) *b->CR1 |=  (1U << 9);
+        /* 多字节读的关键: 只有最后一个字节才 NACK+STOP。
+           原写法在倒数第二个字节就 NACK, 最后一个字节读到的是总线空闲 0xFF,
+           这也是 MAX30102 FIFO 里约 15% 末字节为 0xFF 的根因。 */
+        if (i + 1U == n) {
+            *b->CR1 &= ~(1U << 10);   /* ACK=0, 最后一个字节 */
+            *b->CR1 |=  (1U << 9);    /* STOP */
+        }
         guard = 0U;
         while ((*b->SR1 & (1U << 6)) == 0U) { if (++guard > b->guard_max) { *b->CR1 |= (1U << 9); return 3U; } }
         buf[i] = (uint8_t)*b->DR;
@@ -577,6 +578,15 @@ volatile uint32_t dbg_smp;     /* 累计采样数, 用于核对真实采样速�
 
 static uint8_t page_idx;
 static uint8_t measure_on = 1U;
+
+/* 第4页心率报警上下限: 掉电不保存, 复位后回到 60/100. */
+#define HR_LIMIT_LO       30U
+#define HR_LIMIT_HI      220U
+#define HR_LIMIT_GAP       5U   /* Min 和 Max 至少差 5 bpm */
+static uint16_t hr_min_bpm = 60U;
+static uint16_t hr_max_bpm = 100U;
+static uint8_t  hr_set_sel;     /* 0=调 Min, 1=调 Max */
+static uint8_t  hr_alarm_active;
 
 static const uint8_t oled_init_seq[] = {
     0x00,
@@ -778,6 +788,7 @@ static void draw_str(uint16_t x, uint8_t page, const char *s)
 /* ==================== MPU6050 ==================== */
 static uint8_t mpu_present;
 static int16_t acc_x, acc_y, acc_z;
+static uint32_t acc_sum_last, acc_sum_min, acc_sum_max;
 
 #define MPU_PWR_MGMT_1   0x6BU
 #define MPU_SMPLRT_DIV   0x19U
@@ -816,10 +827,10 @@ static uint8_t mpu_init(void)
                 i2c_wreg(&bus1, addr, MPU_PWR_MGMT_1, 0x80U);
                 delay_ms(100U);
                 i2c_wreg(&bus1, addr, MPU_PWR_MGMT_1, 0x00U);
-                i2c_wreg(&bus1, addr, MPU_SMPLRT_DIV, 0x09U);
+                i2c_wreg(&bus1, addr, MPU_SMPLRT_DIV, 0x09U);   /* 100 Hz 采样 */
                 i2c_wreg(&bus1, addr, MPU_CONFIG, 0x03U);
                 i2c_wreg(&bus1, addr, MPU_GYRO_CONFIG, 0x00U);
-                i2c_wreg(&bus1, addr, MPU_ACCEL_CONFIG, 0x00U);
+                i2c_wreg(&bus1, addr, MPU_ACCEL_CONFIG, 0x00U); /* ±2g, 16384 LSB/g，保持原厂配置 */
                 dbg_mrd_post = (uint32_t)i2c_rreg(&bus1, addr, MPU_ACCEL_XOUT_H, &t);
                 return 0U;
             }
@@ -833,31 +844,58 @@ static uint8_t mpu_init(void)
 volatile uint32_t dbg_mrd;   /* 0x100 = 6 字节全读成功; (rc<<4)|(i+1) = 第 i+1 个字节失败及其返回码 */
 volatile uint32_t dbg_mrd_boot;  /* boot 阶段(初始化刚结束)试读一次的结果, 用来区分是谁把总线搞坏的 */
 
+/* 三轴加速度平方和。先除以 8 再平方，避免满量程时 int32 溢出；
+   最终只用于和阈值平方比较，不在这里开方。 */
+static uint32_t accel_sum_sq(int16_t x, int16_t y, int16_t z)
+{
+    uint32_t ax = (x < 0) ? (uint32_t)(-(int32_t)x) : (uint32_t)x;
+    uint32_t ay = (y < 0) ? (uint32_t)(-(int32_t)y) : (uint32_t)y;
+    uint32_t az = (z < 0) ? (uint32_t)(-(int32_t)z) : (uint32_t)z;
+    ax >>= 3; ay >>= 3; az >>= 3;
+    return ax * ax + ay * ay + az * az;
+}
+
 static uint8_t mpu_read(void)
 {
     uint8_t b[6];
-    uint8_t i;
-    uint8_t rc;
     static uint32_t fail_ms;
+    uint8_t rc;
 
-    for (i = 0U; i < 6U; i++) {
-        rc = i2c_rreg(&bus1, mpu_addr, (uint8_t)(MPU_ACCEL_XOUT_H + i), &b[i]);
-        if (rc != 0U) {
-            dbg_mrd = ((uint32_t)rc << 4) | ((uint32_t)i + 1U);
-            /* 每半秒做一次 9 脉冲总线解锁: 从机在传输中途被打断会把 SDA 占住,
-               之后所有 START 都超时(rc=1), 单纯重试是没用的。 */
-            if ((now_ms() - fail_ms) >= 500U) {
-                fail_ms = now_ms();
-                i2c1_bus_recover();
-            }
-            return 1U;
+    /* 一次突发读 6 字节: 原来 6 个单字节事务要 6 次 START/STOP, 在 28Hz 主循环下
+       一次撞击尖峰很容易被漏掉; 突发读同时保证 XYZ 是同一采样时刻。 */
+    rc = i2c_read(&bus1, mpu_addr, MPU_ACCEL_XOUT_H, b, 6U);
+    if (rc != 0U) {
+        dbg_mrd = ((uint32_t)rc << 4) | 6U;
+        /* 每半秒做一次 16 脉冲总线解锁: 从机在传输中途被打断会把 SDA 占住,
+           之后所有 START 都超时(rc=1), 单纯重试是没用的。 */
+        if ((now_ms() - fail_ms) >= 500U) {
+            fail_ms = now_ms();
+            i2c1_bus_recover();
         }
+        return 1U;
     }
     dbg_mrd = 0x100U;
 
     acc_x = (int16_t)(((uint16_t)b[0] << 8) | b[1]);
     acc_y = (int16_t)(((uint16_t)b[2] << 8) | b[3]);
     acc_z = (int16_t)(((uint16_t)b[4] << 8) | b[5]);
+
+    acc_sum_last = accel_sum_sq(acc_x, acc_y, acc_z);
+
+    /* 用 16 个采样的小窗口保持 min/max: 自由落体和落地撞击通常不在同一采样点,
+       单点比较会漏; 窗口保持让一次 FREE 和随后一次 HIT 都能被状态机看到。 */
+    {
+        static uint8_t acc_win;
+        if (acc_win == 0U) {
+            acc_sum_min = acc_sum_last;
+            acc_sum_max = acc_sum_last;
+        } else {
+            if (acc_sum_last < acc_sum_min) acc_sum_min = acc_sum_last;
+            if (acc_sum_last > acc_sum_max) acc_sum_max = acc_sum_last;
+        }
+        acc_win++;
+        if (acc_win >= 16U) acc_win = 0U;
+    }
     return 0U;
 }
 
@@ -1493,6 +1531,29 @@ static uint8_t spo2_valid;
 static uint8_t pr_ac_used;   /* 本窗 PR 是否来自自相关兜底(屏显标 [AC] 用) */
 static volatile float pitch_val, roll_val;
 
+/* PR 平滑链的跨窗历史。无手指/停机/重新放手指时必须整体清零:
+   否则上一次的 lag 投票和中位数还会把新读数往旧值拉。 */
+static uint8_t lag_ring[15];
+static uint8_t lag_i, lag_n;
+static float   ac_hist[15];
+static uint8_t ac_i, ac_n;
+static uint8_t jump_n;
+static uint8_t sp_hist_clear_req = 1U;
+
+static void pr_history_reset(void)
+{
+    uint8_t i;
+    for (i = 0U; i < 15U; i++) {
+        lag_ring[i] = 0U;
+        ac_hist[i] = 0.0f;
+    }
+    lag_i = 0U;
+    lag_n = 0U;
+    ac_i = 0U;
+    ac_n = 0U;
+    jump_n = 0U;
+}
+
 static int16_t isqrt32(int32_t v)
 {
     int16_t r = 0;
@@ -1508,6 +1569,53 @@ static void clear_vitals(void)
     pr_val   = 0.0f;
     pi_val   = 0.0f;
     spo2_valid = 0U;
+    pr_ac_used = 0U;
+    pr_history_reset();
+    sp_hist_clear_req = 1U;
+}
+
+/* 输出层统一有效性判据: 必须"正在测量 + 传感器在线 + 本窗血氧有效"三者同时成立。
+   任一条件不满足, 屏显和串口都不许再拿上一次的数值充数。
+   注意: 不加 3 秒保持窗口 —— 那等于主动显示 3 秒假数据, 比立即置 "--" 更糟。 */
+static uint8_t vitals_out_valid(void)
+{
+    return (uint8_t)((measure_on && max_present && spo2_valid) ? 1U : 0U);
+}
+
+/* 心率上下限: 只做蜂鸣器报警, 不往 OLED 写报警状态.
+   无效读数/停机/传感器掉线时立即退出报警, 避免拿旧心率一直响. */
+static void hr_alarm_update(void)
+{
+    uint16_t pr_round;
+
+    if (!vitals_out_valid() || pr_val < 45.0f) {
+        hr_alarm_active = 0U;
+        return;
+    }
+    pr_round = (uint16_t)(pr_val + 0.5f);
+    hr_alarm_active = (uint8_t)((pr_round < hr_min_bpm || pr_round > hr_max_bpm) ? 1U : 0U);
+}
+
+/* 第4页设置: delta 为 +1/-1, 长按用 +5/-5. Min/Max 之间至少留 5 bpm. */
+static void hr_limits_adjust(int16_t delta)
+{
+    int16_t v;
+
+    if (hr_set_sel == 0U) {
+        v = (int16_t)hr_min_bpm + delta;
+        if (v < (int16_t)HR_LIMIT_LO) v = (int16_t)HR_LIMIT_LO;
+        if (v > (int16_t)hr_max_bpm - (int16_t)HR_LIMIT_GAP) {
+            v = (int16_t)hr_max_bpm - (int16_t)HR_LIMIT_GAP;
+        }
+        hr_min_bpm = (uint16_t)v;
+    } else {
+        v = (int16_t)hr_max_bpm + delta;
+        if (v < (int16_t)hr_min_bpm + (int16_t)HR_LIMIT_GAP) {
+            v = (int16_t)hr_min_bpm + (int16_t)HR_LIMIT_GAP;
+        }
+        if (v > (int16_t)HR_LIMIT_HI) v = (int16_t)HR_LIMIT_HI;
+        hr_max_bpm = (uint16_t)v;
+    }
 }
 
 /* 不开 libm 的简易平方根: 牛顿迭代 */
@@ -1758,8 +1866,9 @@ static void maxim_heart_rate_and_oxygen_saturation(uint32_t *pun_ir_buffer, int3
    这里用同一窗口的 IR 做第二道防线:
      1) 16 点滑动均值当基线做高通, x[i] = IR[i] - mean16(IR);
      2) 归一化自相关 r(lag) = Σx[i]x[i+lag] / ((Σx[i]² + Σx[i+lag]²)/2);
-     3) 先按生理区间 lag ∈ [26,40](75~115bpm) 找最大, 防倍周期锁定(把两拍当一拍);
-        该区间无峰时再退回 [18,80] 全区间取最大, 且 r ≥ 0.30;
+     3) 先按生理区间 lag ∈ [26,50](60~115bpm) 找归一化自相关的局部极大,
+        防倍周期锁定(把两拍当一拍); 该区间无局部极大时再退回 [18,80]
+        全区间, 同样只认局部极大且 r ≥ 0.30;
      4) PR = 60·fs/lag = 3000/lag (fs = 50Hz)。
    全 int32 乘加, 不开方, 8MHz 下几十毫秒, 每秒调用一次。 */
 #define AC_MW      16U
@@ -1821,26 +1930,64 @@ static uint16_t hr_by_autocorr(const uint32_t *buf, uint16_t n, float *r_out)
         }
     }
 
-    /* 3) 先按生理区间(26~40 → 75~115bpm)取最大, 这一步专门防"倍周期锁定":
-       真实 ~92bpm 时周期约 33 点, 但自相关在 lag≈57(2 倍周期)可能更高,
-       若直接取全局最大就会把两拍当一拍, PR 掉到 52。 */
+    /* 3) 先按生理区间(26~50 → 60~115bpm)找归一化自相关的局部极大。
+       不能只取区间最大: 60~74bpm 的真实周期在 40~50 点, lag=40 的 r
+       仍有 0.31~1.0, 区间最大会永远返回 75。局部极大要求 r[lag]
+       同时不小于左右邻居, 这样 lag=40 的肩部不会被当成峰。 */
     r_cur = 0.0f;
-    for (lag = 26U; lag <= 40U; lag++) {
-        if (ac_r_buf[lag] > r_cur) { r_cur = ac_r_buf[lag]; best = lag; }
+    for (lag = 26U; lag <= 50U; lag++) {
+        float rv = ac_r_buf[lag];
+        if ((rv >= AC_R_MIN) &&
+            (rv >= ac_r_buf[lag - 1U]) &&
+            (rv >= ac_r_buf[lag + 1U]) &&
+            (rv > r_cur)) {
+            r_cur = rv;
+            best = lag;
+        }
     }
+
+    /* 高心率(>115bpm)的基频 lag 已落到 26 以下, 但它的 2 倍周期仍可能
+       落在 26~50 内并被选成"峰"。若 best 的一半附近存在 r 接近的局部极大,
+       取更短的那个, 防止 120bpm 被锁成 60bpm。 */
+    if (best >= (2U * AC_LAG_MIN)) {
+        uint16_t half = (uint16_t)(best / 2U);
+        uint16_t hlo, hhi, h;
+        hlo = (half > AC_LAG_MIN) ? (uint16_t)(half - 1U) : AC_LAG_MIN;
+        hhi = (uint16_t)(half + 1U);
+        if (hhi > AC_LAG_MAX) hhi = AC_LAG_MAX;
+        for (h = hlo; h <= hhi; h++) {
+            float rv = ac_r_buf[h];
+            if ((rv >= AC_R_MIN) &&
+                (rv >= ac_r_buf[h - 1U]) &&
+                (rv >= ac_r_buf[h + 1U]) &&
+                (rv >= r_cur * 0.95f)) {
+                best = h;
+                r_cur = rv;
+                break;
+            }
+        }
+    }
+
     if (best > 0U && r_cur >= AC_R_MIN) {
         if (r_out) *r_out = r_cur;
         g_ac_r = r_cur;
         return best;
     }
 
-    /* 4) 生理区间内没有峰(心率确实很低/很高或信号差), 再退回全区间取最大 */
+    /* 4) 优先区间内没有局部极大(心率更低/更高或信号差), 再退回全区间;
+       全区间同样只认局部极大, 不取"最大肩部"。 */
     best = 0U;
     r_cur = 0.0f;
     for (lag = AC_LAG_MIN; lag <= AC_LAG_MAX; lag++) {
-        if (ac_r_buf[lag] > r_cur) { r_cur = ac_r_buf[lag]; best = lag; }
+        float rv = ac_r_buf[lag];
+        if ((rv >= AC_R_FULL) &&
+            (rv >= ac_r_buf[lag - 1U]) &&
+            (rv >= ac_r_buf[lag + 1U]) &&
+            (rv > r_cur)) {
+            r_cur = rv;
+            best = lag;
+        }
     }
-    if (best > 0U && r_cur < AC_R_FULL) best = 0U;
     if (best > 0U && r_out) *r_out = ac_r_buf[best];
     g_ac_r = (best > 0U) ? ac_r_buf[best] : 0.0f;
     return best;
@@ -1890,6 +2037,13 @@ static float hr_by_spectrum(const int32_t *x, uint16_t n, uint16_t *k_out)
     float mean_mag = 0.0f, delta, f;
 
     if (!sp_init_done) sp_init();
+
+    /* 无手指/停机后不能把上一段谱的记忆带入新测量 */
+    if (sp_hist_clear_req) {
+        for (i = 0U; i <= (SP_K_HI - SP_K_LO); i++) sp_sm[i] = 0.0f;
+        sp_sm_n = 0U;
+        sp_hist_clear_req = 0U;
+    }
 
     for (k = SP_K_LO; k <= SP_K_HI; k++) {
         coeff = 2.0f * sp_cos[k];
@@ -1994,10 +2148,7 @@ static void ppg_algo_run(void)
        所以先用 IR 直流门限挡掉: 低于 8000 直接判为无信号, 不跑算法。 */
     for (i = 0U; i < BUFFER_SIZE; i++) sum_ir += pbuf_ir[i];
     if ((sum_ir / BUFFER_SIZE) < 8000U) {
-        spo2_val = 0.0f;
-        pr_val   = 0.0f;
-        pi_val   = 0.0f;
-        spo2_valid = 0U;
+        clear_vitals();              /* 同时清 PR 投票/中位数/频谱平滑历史 */
         for (i = 0U; i < (uint16_t)(BUFFER_SIZE - 50); i++) {
             pbuf_ir[i]  = pbuf_ir[i + 50U];
             pbuf_red[i] = pbuf_red[i + 50U];
@@ -2038,10 +2189,8 @@ static void ppg_algo_run(void)
             /* lag 域投票: 自相关每窗可能选到相邻的次级峰(33/36/40 → 91/83/75 bpm),
                单窗结果不可信, 只在相邻 lag 上跳 3~7 就已经让 PR 摆动 16。
                取最近 15 窗里"出现最多、且互相相差不超过 1"的 lag 当周期;
-               两簇计数接近时取较短的那个 —— 倍周期错锁的峰总落在更长的 lag 上。 */
-            static uint8_t lag_ring[15];
-            static uint8_t lag_i = 0U, lag_n = 0U;
-
+               两簇计数接近时取较短的那个 —— 倍周期错锁的峰总落在更长的 lag 上。
+               历史环在 clear_vitals() 里统一清零, 不再用函数内 static。 */
             if (lag > 0U && ac_r >= 0.18f) {
                 float a = 3000.0f / (float)lag;
                 if (a >= 35.0f && a <= 140.0f) {
@@ -2082,10 +2231,8 @@ static void ppg_algo_run(void)
             /* 9 点中位数 + 判决迟滞: 手指微动/压力变化会让单窗判决在相邻 bin 之间翻转,
                5 点挡不住; 9 点里要 5 个窗都指向同一值才会翻转。
                再加一道迟滞: 与当前输出差 >12bpm 视为可疑跳变, 要连续 3 窗确认才改口,
-               单窗跳到 2 倍频/分频不会被直接显示出来。 */
-            static float   ac_hist[15];
-            static uint8_t ac_i = 0U, ac_n = 0U;
-            static uint8_t jump_n = 0U;
+               单窗跳到 2 倍频/分频不会被直接显示出来。
+               历史环在 clear_vitals() 里统一清零, 不再用函数内 static。 */
             uint8_t hold = 0U;
             float med, cand;
 
@@ -2274,16 +2421,20 @@ static void calc_spo2(void)
 
 static void calc_angles(void)
 {
-    float ax = (float)acc_x, ay = (float)acc_y, az = (float)acc_z;
-    float mag = (float)isqrt32((int32_t)(ay * ay + az * az));
-    if (mag > 1.0f) {
-        pitch_val = (-ax / mag) * 57.3f;
+    /* 满量程时 raw 可达 32768, 直接平方会溢出 int32;
+       先除以 8 再算角度, 比值不变。 */
+    int32_t ax = (int32_t)acc_x / 8;
+    int32_t ay = (int32_t)acc_y / 8;
+    int32_t az = (int32_t)acc_z / 8;
+    int16_t mag = isqrt32(ay * ay + az * az);
+    if (mag > 0) {
+        pitch_val = (-(float)ax / (float)mag) * 57.3f;
         if (pitch_val > 90.0f) pitch_val = 90.0f;
         if (pitch_val < -90.0f) pitch_val = -90.0f;
     }
-    mag = (float)isqrt32((int32_t)(ax * ax + az * az));
-    if (mag > 1.0f) {
-        roll_val = (ay / mag) * 57.3f;
+    mag = isqrt32(ax * ax + az * az);
+    if (mag > 0) {
+        roll_val = ((float)ay / (float)mag) * 57.3f;
         if (roll_val > 90.0f) roll_val = 90.0f;
         if (roll_val < -90.0f) roll_val = -90.0f;
     }
@@ -2302,20 +2453,33 @@ static fall_state_t fall_state;
 static uint16_t fall_timer;
 static uint8_t fall_event;
 static uint32_t fall_alarm_ms;      /* 进入 FALL_ALARM 的时刻(ms), 用于自动复位 */
+/* 诊断计数: 用 SWD 读, 判断自动跌落到底在哪些页面走完过状态机 */
+volatile uint32_t fall_dbg_free;
+volatile uint32_t fall_dbg_impact;
+volatile uint32_t fall_dbg_fallen;
+volatile uint32_t fall_dbg_alarm;
+volatile uint32_t fall_dbg_alarm_page[3];
+volatile uint32_t fall_dbg_last_page;
 static uint8_t fall_manual_mode;    /* 1=上位机手动模拟触发, 只由上位机再次触发清除 */
 
 #define FALL_FREE_G     0.60f
 #define FALL_IMPACT_G   2.50f
 #define FALL_ANGLE_DEG  60.0f
 #define FALL_FREE_MIN   3U
-#define FALL_FREE_WIN   100U
-#define FALL_ANGLE_WIN  200U
-#define FALL_CONFIRM    300U
+#define FALL_FREE_WIN   20U      /* ~1.3 s @15Hz 主循环 */
+#define FALL_IMPACT_HOLD 8U      /* HIT 至少显示约 0.3 s */
+#define FALL_CONFIRM    25U      /* FALLEN 确认约 0.9 s @27Hz, 合计约 1.2 s 进报警 */
+
+/* MPU 保持原厂 ±2g, 16384 LSB/g; accel_sum_sq() 先把 raw 右移 3 位再平方,
+   所以这里比较的是 (g*16384/8)^2 = (g*2048)^2。
+   撞击阈值取 1.8g，超过 ±2g 的尖峰会饱和在 2g，仍然大于 1.8g，可以确认。 */
+#define FALL_FREE_SUM    1510000U   /* 约 0.60g */
+#define FALL_IMPACT_SUM  40700000U  /* 约 1.80g */
 
 static void fall_update(void)
 {
-    float ax = (float)acc_x, ay = (float)acc_y, az = (float)acc_z;
-    float g = (float)isqrt32((int32_t)(ax * ax + ay * ay + az * az)) / 16384.0f;
+    uint8_t freefall = (acc_sum_min < FALL_FREE_SUM) ? 1U : 0U;
+    uint8_t impact   = (acc_sum_max > FALL_IMPACT_SUM) ? 1U : 0U;
     uint8_t tilted = (pitch_val > FALL_ANGLE_DEG || pitch_val < -FALL_ANGLE_DEG ||
                       roll_val  > FALL_ANGLE_DEG || roll_val  < -FALL_ANGLE_DEG);
 
@@ -2323,15 +2487,26 @@ static void fall_update(void)
 
     switch (fall_state) {
     case FALL_IDLE:
-        if (g < FALL_FREE_G) { fall_state = FALL_FREEFALL; fall_timer = 0U; }
+        if (freefall) {
+            fall_state = FALL_FREEFALL;
+            fall_timer = 0U;
+            fall_dbg_free++;
+            /* 一次窗口里同时出现失重和撞击时, 直接进撞击态。 */
+            if (impact) {
+                fall_state = FALL_IMPACT;
+                fall_timer = 0U;
+                fall_dbg_impact++;
+            }
+        }
         break;
 
     case FALL_FREEFALL:
         fall_timer++;
-        if (g > FALL_IMPACT_G) {
+        if (impact) {
             fall_state = FALL_IMPACT;
             fall_timer = 0U;
-        } else if (g > FALL_FREE_G && fall_timer < FALL_FREE_MIN) {
+            fall_dbg_impact++;
+        } else if (!freefall && fall_timer < FALL_FREE_MIN) {
             fall_state = FALL_IDLE;
         }
         if (fall_timer > FALL_FREE_WIN) fall_state = FALL_IDLE;
@@ -2339,20 +2514,27 @@ static void fall_update(void)
 
     case FALL_IMPACT:
         fall_timer++;
-        if (tilted) { fall_state = FALL_FALLEN; fall_timer = 0U; }
-        else if (fall_timer > FALL_ANGLE_WIN) fall_state = FALL_IDLE;
+        /* 倾斜只用来提前确认; 平着落到桌上也会在 HIT 保持 8 个循环后进入 FALLEN。 */
+        if (tilted || fall_timer > FALL_IMPACT_HOLD) {
+            fall_state = FALL_FALLEN;
+            fall_timer = 0U;
+            fall_dbg_fallen++;
+        }
         break;
 
     case FALL_FALLEN:
         fall_timer++;
+        /* 不再用“平放且约 1g”来撤销: 失重 + >2.5g 撞击本身就是一次跌落,
+           否则平着掉到桌面永远进不了报警。 */
         if (fall_timer > FALL_CONFIRM) {
             fall_state = FALL_ALARM;
             fall_timer = 0U;
             fall_alarm_ms = now_ms();
             fall_event = 1U;
+            fall_dbg_alarm++;
+            fall_dbg_last_page = page_idx;
+            if (page_idx < 3U) fall_dbg_alarm_page[page_idx]++;
             BEEP_ON();
-        } else if (!tilted && g > 0.8f && g < 1.2f) {
-            fall_state = FALL_IDLE;
         }
         break;
 
@@ -2516,13 +2698,25 @@ static void proto_send(uint8_t type, const uint8_t *payload, uint8_t len)
 static void send_data_frame(void)
 {
     uint8_t p[6];
-    p[0] = (uint8_t)(spo2_val + 0.5f);
-    p[1] = (uint8_t)(pr_val + 0.5f);
-    p[2] = (uint8_t)(pi_val * 10.0f + 0.5f);
+    uint8_t ok = vitals_out_valid();
+    uint8_t pr_ok = (uint8_t)((ok && pr_val >= 45.0f) ? 1U : 0U);
+
+    /* 无效帧发 0, 让上位机按协议判"无信号", 而不是把旧值原样记进验收数据 */
+    p[0] = ok ? (uint8_t)(spo2_val + 0.5f) : 0U;
+    p[1] = pr_ok ? (uint8_t)(pr_val + 0.5f) : 0U;
+    p[2] = ok ? (uint8_t)(pi_val * 10.0f + 0.5f) : 0U;
     p[3] = (uint8_t)(pitch_val + 90.0f);
     p[4] = (uint8_t)(roll_val + 90.0f);
     p[5] = (uint8_t)fall_state;
     proto_send(0x01U, p, 6U);
+}
+
+static void send_hr_limits_frame(void)
+{
+    uint8_t p[2];
+    p[0] = (uint8_t)hr_min_bpm;
+    p[1] = (uint8_t)hr_max_bpm;
+    proto_send(0x04U, p, 2U);   /* 上位机据此把 PR 在区间内显示绿色、越界显示红色 */
 }
 
 /* 波形帧: AA 55 03 0C | ir0[3] red0[3] ir1[3] red1[3] | sum */
@@ -2636,11 +2830,11 @@ static void draw_page_main(void)
 
     draw_str(0U, 0U, "PPG v5");
     draw_str(48U, 0U, measure_on ? "MEAS" : "STOP");
-    draw_str(96U, 0U, "1/3");
+    draw_str(96U, 0U, "1/4");
     /* 心跳点: 右上角每秒 o/. 交替。闪 = 屏在刷新; 不闪 = 屏真冻住了, 一眼区分 */
     draw_char(120U, 0U, ((now_ms() / 1000U) & 1U) ? 'o' : '.');
 
-    if (spo2_valid) {
+    if (vitals_out_valid()) {
         draw_str(0U, 2U, "SpO2");
         fmt_u(line_buf, (uint16_t)(spo2_val + 0.5f), 3U);
         draw_str(40U, 2U, line_buf);
@@ -2649,21 +2843,25 @@ static void draw_page_main(void)
         draw_str(0U, 2U, "SpO2 --");
     }
 
-    if (spo2_valid && pr_val >= 45.0f) {
+    if (vitals_out_valid() && pr_val >= 45.0f) {
         draw_str(0U, 4U, "PR");
         fmt_u(line_buf, (uint16_t)(pr_val + 0.5f), 3U);
         draw_str(24U, 4U, line_buf);
         draw_str(56U, 4U, "bpm");
         if (pr_ac_used) draw_str(84U, 4U, "[AC]");   /* 本窗 PR 来自自相关兜底 */
-    } else if (spo2_valid) {
+    } else if (vitals_out_valid()) {
         draw_str(0U, 4U, "PR --");
+    } else if (!measure_on) {
+        draw_str(0U, 4U, "STOPPED");
+    } else if (max_ir_raw >= 8000U) {
+        draw_str(0U, 4U, "MEASURING...");
     } else if (max_present) {
         draw_str(0U, 4U, "PRESS FINGER");
     } else {
         draw_str(0U, 4U, "-- no sensor --");
     }
 
-    if (!spo2_valid && max_present) {
+    if (measure_on && !vitals_out_valid() && max_present) {
         /* 没手指时也要有活数据可看: 直接显示 IR/RED 原始值(千为单位),
            这样一眼就知道模块在正常采样, 而不是"屏幕死了"。 */
         uint16_t irk = (uint16_t)(max_ir_raw / 1000U);
@@ -2685,7 +2883,6 @@ static void draw_page_main(void)
         draw_str(48U, 6U, "R");
         fmt_s(t, (int16_t)roll_val, 4U);
         draw_str(56U, 6U, t);
-        draw_str(96U, 6U, fall_state_str());
     }
 }
 
@@ -2694,7 +2891,7 @@ static void draw_page_imu(void)
     char t[10];
 
     draw_str(0U, 0U, "IMU MPU6050");
-    draw_str(96U, 0U, "2/3");
+    draw_str(96U, 0U, "2/4");
 
     draw_str(0U, 2U, "Pitch");
     fmt_s(t, (int16_t)pitch_val, 4U);
@@ -2727,7 +2924,7 @@ static void draw_page_sys(void)
     oled_clear();
 
     draw_str(0U, 0U, "SYSTEM");
-    draw_str(96U, 0U, "3/3");
+    draw_str(96U, 0U, "3/4");
 
     draw_str(0U, 2U, "OLED: ");
     draw_str(64U, 2U, oled_present ? "OK" : "--");
@@ -2739,6 +2936,28 @@ static void draw_page_sys(void)
     draw_str(64U, 6U, max_present ? "OK" : "--");
 }
 
+static void draw_page_settings(void)
+{
+    char t[8];
+
+    draw_str(0U, 0U, "SETTINGS");
+    draw_str(96U, 0U, "4/4");
+
+    draw_str(0U, 2U, (hr_set_sel == 0U) ? ">Min" : " Min");
+    fmt_u(t, hr_min_bpm, 3U);
+    draw_str(40U, 2U, t);
+    draw_str(72U, 2U, "bpm");
+
+    draw_str(0U, 4U, (hr_set_sel == 1U) ? ">Max" : " Max");
+    fmt_u(t, hr_max_bpm, 3U);
+    draw_str(40U, 4U, t);
+    draw_str(72U, 4U, "bpm");
+
+    /* 本页按键: S1 +, S2 -, S3 切换 Min/Max, S4 返回第1页. */
+    draw_str(0U, 6U, "K1+ K2- K3 Sel");
+    draw_str(112U, 6U, "S4");
+}
+
 
 
 static void draw_screen(void)
@@ -2746,7 +2965,8 @@ static void draw_screen(void)
     oled_clear();
     if (page_idx == 0U)      draw_page_main();
     else if (page_idx == 1U) draw_page_imu();
-    else                     draw_page_sys();
+    else if (page_idx == 2U) draw_page_sys();
+    else                     draw_page_settings();
     oled_flush_begin();            /* 只置标志, 由主循环每圈写一页 */
 }
 
@@ -2754,6 +2974,7 @@ static void draw_screen(void)
 int main(void)
 {
     uint8_t r, i;
+    static uint32_t mpu_retry_ms = 0U;
 
     clock_init();                 /* 先定主频(72MHz 或退回 8MHz), 后面外设按它换算 */
     tick_start();                 /* 毫秒时钟必须在任何 delay_ms 之前启动 */
@@ -2838,12 +3059,17 @@ int main(void)
     fall_timer = 0U;
     page_idx = 0U;      /* 开机显示主界面 */
     measure_on = 1U;
+    hr_min_bpm = 60U;
+    hr_max_bpm = 100U;
+    hr_set_sel = 0U;
+    hr_alarm_active = 0U;
 
     uint32_t now, t_wave = 0U, t_data = 0U, t_disp = 0U;
 
     while (1) {
         uint8_t e;
 
+        if (page_idx > 3U) page_idx = 0U;   /* 防越界: 页面只有 0~3 */
         dbg_cnt++;                       /* 心跳: 供 ST-Link 确认固件在跑 */
 
         /* ---- 上位机命令: 收到 'F' 切换模拟跌倒(报警/清除), 非阻塞 ---- */
@@ -2873,54 +3099,74 @@ int main(void)
 #endif
         /* ---- 按键 ---- */
         e = key_poll(0U, KEY1_DOWN());
-        if (e == 1U) measure_on = measure_on ? 0U : 1U;
+        if (page_idx == 3U) {
+            /* 第4页: S1 调大当前选中项, 长按一次 +5 */
+            if (e == 1U)      hr_limits_adjust(1);
+            else if (e == 2U) hr_limits_adjust(5);
+        } else if (e == 1U) {
+            measure_on = measure_on ? 0U : 1U;
+            /* 停机/恢复都丢掉旧窗口: 否则恢复瞬间会拿停机前的 8 秒数据算出"新"读数 */
+            clear_vitals();
+            pbuf_cnt = 0U;
+        }
 
         e = key_poll(1U, KEY2_DOWN());
-        if (e == 1U) page_idx = (uint8_t)((page_idx + 1U) % 3U);
+        if (page_idx == 3U) {
+            /* 第4页: S2 调小当前选中项, 长按一次 -5 */
+            if (e == 1U)      hr_limits_adjust(-1);
+            else if (e == 2U) hr_limits_adjust(-5);
+        } else if (e == 1U) {
+            page_idx = (uint8_t)((page_idx + 1U) % 4U);
+            if (page_idx == 3U) hr_set_sel = 0U;
+        }
 
         e = key_poll(2U, KEY3_DOWN());
-        if (e == 1U && fall_state == FALL_ALARM) fall_clear_alarm();
-
-        e = key_poll(3U, KEY4_DOWN());
-        if (e == 2U) fall_manual_trigger();
-
-        /* ---- 页面自动轮播: 按键硬件失效时的兜底, 每 3 秒切一页 ----
-           手指压在 MAX30102 上时锁定血氧主界面并停止轮播(IR 从空载的百级
-           升到十万级, 据此判手指在位); 手指拿开后重新开始 3 秒轮播。 */
-        {
-            static uint32_t page_auto_ms;
-            static uint32_t finger_ms;
-            if (max_ir_raw > 50000U) {
-                if (finger_ms == 0U) finger_ms = now_ms();
-                if ((now_ms() - finger_ms) >= 300U) {   /* 连续 300ms 才认定, 防抖 */
-                    page_idx = 0U;                      /* 锁定血氧主界面 */
-                }
-                page_auto_ms = now_ms();                /* 在位期间一直重置轮播计时 */
-            } else {
-                finger_ms = 0U;
-                if ((now_ms() - page_auto_ms) >= 3000U) {
-                    page_auto_ms = now_ms();
-                    page_idx = (uint8_t)((page_idx + 1U) % 3U);
-                }
+        if (e == 1U) {
+            if (fall_state == FALL_ALARM) {
+                fall_clear_alarm();
+            } else if (page_idx == 3U) {
+                hr_set_sel = (uint8_t)(hr_set_sel ? 0U : 1U);
             }
         }
 
-        /* ---- 报警时蜂鸣器 2Hz 间歇 ---- */
+        e = key_poll(3U, KEY4_DOWN());
+        if (page_idx == 3U) {
+            /* 第4页: S4 返回第1页; 本页不触发手动跌倒报警 */
+            if (e == 1U || e == 2U) page_idx = 0U;
+        } else if (e == 2U) {
+            fall_manual_trigger();
+        }
+
+        /* 自动轮播已移除: 页面只由 KEY2 手动切换, 不再随 3 秒计时自动跳页。 */
+
+        /* ---- 蜂鸣器: 跌倒优先, 其次心率越界; 两者都没有就关 ---- */
+        hr_alarm_update();
         if (fall_state == FALL_ALARM) {
-            /* 2Hz 间歇: 响 250ms / 停 250ms, 用真时间基准, 不随主循环速率漂移 */
+            /* 跌倒 2Hz 间歇: 响 250ms / 停 250ms, 用真时间基准 */
             if (((now_ms() / 250U) & 1U) == 0U) BEEP_ON();
             else                                BEEP_OFF();
+        } else if (hr_alarm_active) {
+            /* 心率越界 1Hz 间歇: 响 200ms / 停 800ms */
+            if ((now_ms() % 1000U) < 200U) BEEP_ON();
+            else                          BEEP_OFF();
+        } else {
+            BEEP_OFF();
         }
 
         /* ---- 传感器 ---- */
-        if (mpu_present) {
-            if (mpu_read() == 0U) {
-                calc_angles();
-                fall_update();
-                if (fall_event) {
-                    uint8_t ev = 1U;
-                    proto_send(0x02U, &ev, 1U);
-                }
+        if (!mpu_present) {
+            /* J3 的 MPU6050 模块可能晚于 MCU 上电, 或接触不良后重新插好;
+               每秒重试一次, 不必重新烧录。 */
+            if ((now_ms() - mpu_retry_ms) >= 1000U) {
+                mpu_retry_ms = now_ms();
+                mpu_present = (mpu_init() == 0U) ? 1U : 0U;
+            }
+        } else if (mpu_read() == 0U) {
+            calc_angles();
+            fall_update();
+            if (fall_event) {
+                uint8_t ev = 1U;
+                proto_send(0x02U, &ev, 1U);
             }
         }
         if (max_present && measure_on) (void)max_read_fifo();
@@ -2935,11 +3181,13 @@ int main(void)
         }
         if ((now - t_data) >= 1000U) {                  /* 每秒算一次血氧并上报 */
             t_data = now;
-            if (max_present && measure_on) ppg_algo_run();   /* Maxim 官方算法, 4 秒窗口 1Hz 刷新 */
+            if (max_present && measure_on) ppg_algo_run();   /* Maxim 官方算法, 8 秒窗口 1Hz 刷新 */
+            send_hr_limits_frame();
             send_data_frame();
             dbg_ping1 = (uint32_t)i2c_ping(&bus1, OLED_ADDR);
             oled_health();                               /* 屏掉 ACK 就自动重建总线+重初始化 */
             max_health_check();                          /* 每秒校验芯片配置, 掉回默认就重配 */
+            if (!max_present && spo2_valid) clear_vitals();  /* 拔掉传感器后清掉旧值, 防重插时闪现 */
         }
         if (!flush_busy && (now - t_disp) >= 250U) {     /* 上一帧写完才允许重画, 4Hz */
             t_disp = now;

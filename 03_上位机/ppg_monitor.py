@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PPG_STM32 转接板 v5 —— PC 上位机
+PPG_STM32 转接板 v6 —— PC 上位机
 
 串口 / 蓝牙虚拟 COM → 实时 PPG 波形 + SpO2 / PR / PI + 跌倒状态
 
@@ -10,6 +10,7 @@ PPG_STM32 转接板 v5 —— PC 上位机
     0x01 (len=6) : SpO2(1) PR(1) PI*10(1) pitch+90(1) roll+90(1) state(1)
     0x02 (len=0/1) : 跌倒事件（兼容两种事件包长度）
     0x03 (len=6) : ir0[18bit BE] ir1[18bit BE]，两个连续 IR 采样点
+    0x04 (len=2) : 心率报警区间 min(1) max(1)，来自 STM32 第 4 页设置
 
 校验和：从帧头到 payload 末尾逐字节累加，取低 8 位。
 
@@ -63,6 +64,7 @@ FRAME_LENGTHS = {
     0x01: {6},       # 指标帧
     0x02: {0, 1},    # 跌倒事件帧，兼容原型的 len=1 与常见的 len=0
     0x03: {6, 12},   # 波形帧: 6=仅IR(旧), 12=IR+RED 双通道(新)
+    0x04: {2},       # 心率区间帧: min, max（下位机设置页同步）
 }
 WAVE_POINTS = 1000   # 波形窗口保留的 IR 采样点数
 MAX_VALUE_18BIT = 0x3FFFF
@@ -79,6 +81,12 @@ FALL_NAMES = {
     4: "跌倒报警",
 }
 VALUE_STYLE = "color:{color};font-size:25px;font-weight:600;"
+PR_NORMAL_COLOR = "#76ff03"   # 与原来卡片一致的绿色
+PR_ALARM_COLOR = "#ff1744"    # 超出下位机设置区间时红色
+PR_IDLE_COLOR = "#8fa3b5"     # 无有效 PR 时灰色
+HR_LIMIT_LO = 30
+HR_LIMIT_HI = 220
+HR_LIMIT_GAP = 5
 
 
 def local_timestamp():
@@ -254,6 +262,7 @@ class SerialWorker(QtCore.QThread):
     """后台串口读取与协议分发，所有界面更新均通过 Qt 信号完成。"""
 
     dataFrame = QtCore.pyqtSignal(int, int, int, int, int, int)
+    hrLimits = QtCore.pyqtSignal(int, int)
     fallEvent = QtCore.pyqtSignal()
     waveFrame = QtCore.pyqtSignal(list)
     waveRed = QtCore.pyqtSignal(list)
@@ -330,6 +339,9 @@ class SerialWorker(QtCore.QThread):
             self.dataFrame.emit(*payload[:6])
         elif frame_type == 0x02:
             self.fallEvent.emit()
+        elif frame_type == 0x04:
+            if len(payload) == 2:
+                self.hrLimits.emit(payload[0], payload[1])
         elif frame_type == 0x03:
             if len(payload) >= 12:
                 ir0 = (payload[0] << 16) | (payload[1] << 8) | payload[2]
@@ -409,7 +421,7 @@ class CsvRecorder:
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PPG_STM32 v5 上位机 — 血氧与跌倒监测")
+        self.setWindowTitle("PPG_STM32 v6 上位机 — 血氧与跌倒监测")
         self.resize(1320, 900)
         self.setMinimumSize(1080, 740)
 
@@ -433,6 +445,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_data_at = 0.0
         self._last_wave_at = 0.0
         self._latest_pi10 = None
+        self._last_pr = 0
+        self.hr_min = 60
+        self.hr_max = 100
+        self._hr_limits_seen = False
+        self._last_pr_color = None
         self._quality = "等待信号"
         self._quality_reason = "等待足够的原始样点"
         self._quality_view_override = False
@@ -546,6 +563,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cards.setSpacing(8)
         self.lbl_spo2 = self._make_card(cards, "血氧 SpO₂", "-- %", "#00e5ff")
         self.lbl_pr = self._make_card(cards, "脉率 PR", "-- bpm", "#76ff03")
+        self.lbl_pr.setToolTip("正常区间 60–100 bpm（随 STM32 设置页自动同步）")
         self.lbl_pi = self._make_card(cards, "灌注指数 PI", "-- %", "#ffd600")
         self.lbl_quality = self._make_card(cards, "信号质量（显示辅助）", "等待信号", "#8fa3b5")
         self.lbl_state = self._make_card(cards, "跌倒状态", "--", "#00e676")
@@ -749,6 +767,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker = SerialWorker(port, baud)
         self.worker = worker
         worker.dataFrame.connect(self._on_data)
+        worker.hrLimits.connect(self._on_hr_limits)
         worker.waveFrame.connect(self._on_wave)
         worker.waveRed.connect(self._on_wave_red)
         worker.fallEvent.connect(self._on_fall)
@@ -906,6 +925,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lbl_spo2.setText("-- %")
         self.lbl_pr.setText("-- bpm")
         self.lbl_pi.setText("-- %")
+        self._last_pr = 0
+        self._apply_pr_color()
         self.lbl_state.setText("--")
         self.lbl_state.setStyleSheet(VALUE_STYLE.format(color="#00e676"))
         self.lbl_pitch.setText("-- / --")
@@ -930,8 +951,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_data(self, spo2, pr, pi10, pitch, roll, state):
         self._last_data_at = time.monotonic()
         self._latest_pi10 = pi10
+        self._last_pr = pr
         self.lbl_spo2.setText(f"{spo2} %" if spo2 > 0 else "-- %")
         self.lbl_pr.setText(f"{pr} bpm" if pr > 0 else "-- bpm")
+        self._apply_pr_color()
         self.lbl_pi.setText(f"{pi10 / 10.0:.1f} %")
         self.lbl_pitch.setText(f"{pitch - 90}° / {roll - 90}°")
 
@@ -952,6 +975,40 @@ class MainWindow(QtWidgets.QMainWindow):
             "write_data", spo2, pr, pi10, pitch, roll, state,
             self.processor.sample_rate, self._quality
         )
+
+    def _on_hr_limits(self, hr_min, hr_max):
+        """接收 STM32 设置页的 Min/Max，PR 颜色随区间实时变化。"""
+        if not (
+            HR_LIMIT_LO <= hr_min <= HR_LIMIT_HI
+            and HR_LIMIT_LO <= hr_max <= HR_LIMIT_HI
+            and hr_max - hr_min >= HR_LIMIT_GAP
+        ):
+            return
+
+        changed = (not self._hr_limits_seen) or (
+            hr_min != self.hr_min or hr_max != self.hr_max
+        )
+        self.hr_min = hr_min
+        self.hr_max = hr_max
+        self._hr_limits_seen = True
+        self.lbl_pr.setToolTip(
+            f"正常区间 {hr_min}–{hr_max} bpm（随 STM32 设置页自动同步）"
+        )
+        if changed:
+            self._log(f"心率报警区间已同步：{hr_min}–{hr_max} bpm")
+        self._apply_pr_color()
+
+    def _apply_pr_color(self):
+        if self._last_pr <= 0:
+            color = PR_IDLE_COLOR
+        elif self._last_pr < self.hr_min or self._last_pr > self.hr_max:
+            color = PR_ALARM_COLOR
+        else:
+            color = PR_NORMAL_COLOR
+        if color == self._last_pr_color:
+            return
+        self._last_pr_color = color
+        self.lbl_pr.setStyleSheet(VALUE_STYLE.format(color=color))
 
     def _on_wave(self, samples):
         # 原始样点先入独立缓冲区；处理结果另存，绝不覆盖原始值。

@@ -22,7 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 FRAME_HEAD = b"\xAA\x55"
-FRAME_LENGTHS = {0x01: {6}, 0x02: {0, 1}, 0x03: {6, 12}}
+FRAME_LENGTHS = {0x01: {6}, 0x02: {0, 1}, 0x03: {6, 12}, 0x04: {2}}
 FALL_NAMES = ["正常", "自由落体", "冲击", "跌倒后静止", "跌倒报警"]
 
 
@@ -66,6 +66,7 @@ class Store:
     def __init__(self):
         self.lock = threading.Lock()
         self.data = dict(spo2=None, pr=None, pi=None, pitch=0, roll=0, state=0,
+                         hr_min=60, hr_max=100,
                          wave=[], wave_red=[], frames=0, connected=False, demo=False, port="")
 
     def update(self, **kw):
@@ -135,6 +136,8 @@ def serial_worker(store, port, baud, stop=None):
                                      pi=round(pi / 10.0, 1),
                                      pitch=pitch - 90, roll=roll - 90, state=st)
                         store.bump()
+                    elif ftype == 0x04 and len(pl) == 2:
+                        store.update(hr_min=pl[0], hr_max=pl[1])
                     elif ftype == 0x03:
                         if len(pl) >= 12:
                             ir0 = (pl[0] << 16) | (pl[1] << 8) | pl[2]
@@ -431,7 +434,10 @@ function render(d){
   $('dot').className = 'dot' + (d.connected ? ' on' : '');
   $('status').textContent = (d.connected ? '已连接 ' : '未连接 ') + (d.port || '');
   $('spo2').textContent = d.spo2 == null ? '--' : d.spo2;
-  $('pr').textContent   = d.pr == null ? '--' : d.pr;
+  const prEl = $('pr');
+  prEl.textContent = d.pr == null ? '--' : d.pr;
+  prEl.style.color = d.pr == null ? '#8b949e'
+    : (d.pr < d.hr_min || d.pr > d.hr_max ? '#ff1744' : '#76ff03');
   $('pi').textContent   = d.pi == null ? '--' : d.pi.toFixed ? d.pi.toFixed(1) : d.pi;
   $('state').textContent = d.state_name || '--';
   $('att').textContent = (d.pitch >= 0 ? '+' : '') + d.pitch + '° / ' + (d.roll >= 0 ? '+' : '') + d.roll + '°';

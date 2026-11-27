@@ -5,10 +5,14 @@ import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteOpenHelper;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -22,6 +26,9 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -29,11 +36,10 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.File;
-import java.io.FileWriter;
 import java.io.InputStream;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -89,12 +95,17 @@ public class MainActivity extends Activity {
     private boolean autoReconnect = true;
     private int reconnectAttempts = 0;
 
-    private boolean recording = false;
-    private FileWriter csvWriter = null;
-    private String csvPath = "";
+    private volatile boolean recording = false;
+    private RecordDb recordDb = null;
+    private volatile int hrMin = 60;
+    private volatile int hrMax = 100;
+    private int lastFallState = 0;
+    private long lastFallEventAt = 0L;
+    private static final int RECORD_LIMIT = 50000;
 
     private BluetoothAdapter reservedAdapter;
     private TextView tvLink;
+    private TextView tvRecords;
     private TextView tvSpo2;
     private TextView tvPr;
     private TextView tvPi;
@@ -110,6 +121,10 @@ public class MainActivity extends Activity {
     private WaveView waveView;
     private FrameLayout rootFrame;
     private View alarmOverlay;
+    private View recordPage = null;
+    private LinearLayout recordList = null;
+    private TextView recordSummary = null;
+    private TextView recordRange = null;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -129,6 +144,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        recordDb = new RecordDb(this);
         buildUi();
         adapter = BluetoothAdapter.getDefaultAdapter();
         reservedAdapter = adapter;
@@ -149,6 +165,26 @@ public class MainActivity extends Activity {
         stopRecord(false);
         running = false;
         closeSocket();
+        if (reader != null) {
+            try {
+                reader.join(800);
+            } catch (InterruptedException ignored) {
+            }
+            reader = null;
+        }
+        if (recordDb != null) {
+            recordDb.close();
+            recordDb = null;
+        }
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (recordPage != null) {
+            closeRecordPage();
+            return;
+        }
+        super.onBackPressed();
     }
 
     private void showGuideIfFirstRun() {
@@ -268,6 +304,19 @@ public class MainActivity extends Activity {
                 showDevicePicker();
             }
         });
+
+        tvRecords = makePill("记录", CYAN);
+        tvRecords.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showRecordPage();
+            }
+        });
+        LinearLayout.LayoutParams recordLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        recordLp.setMargins(0, 0, dp(8), 0);
+        header.addView(tvRecords, recordLp);
         header.addView(tvLink);
         root.addView(header);
 
@@ -614,6 +663,8 @@ public class MainActivity extends Activity {
                     s.connect();
                     connected = true;
                     reconnectAttempts = 0;
+                    lastFallState = 0;
+                    lastFallEventAt = 0;
                     setStatus("已连接 · " + label, GREEN);
                     reader = new Thread(new Runnable() {
                         @Override
@@ -699,6 +750,8 @@ public class MainActivity extends Activity {
             bufLen = 0;
         }
         stopAlarm();
+        lastFallState = 0;
+        lastFallEventAt = 0;
         updateMetrics();
     }
 
@@ -710,6 +763,9 @@ public class MainActivity extends Activity {
         // 本机立刻给出报警反馈，不等固件回传，保证演示时一定有效果
         alarmMutedUntil = 0;
         localAlarmUntil = System.currentTimeMillis() + 4000;
+        stateVal = 4;
+        lastFallState = 4;
+        noteFallEvent("模拟跌倒");
         startAlarm();
         updateMetrics();
         new Thread(new Runnable() {
@@ -786,6 +842,25 @@ public class MainActivity extends Activity {
     }
 
     private void handleFrame(int type, int[] pl) {
+        if (type == 0x04 && pl.length >= 2) {
+            int lo = pl[0] & 0xFF;
+            int hi = pl[1] & 0xFF;
+            if (lo >= 30 && hi <= 220 && hi - lo >= 5) {
+                hrMin = lo;
+                hrMax = hi;
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        updateMetrics();
+                        if (recordRange != null) {
+                            recordRange.setText("PR 正常区间 " + hrMin + "–" + hrMax
+                                    + " bpm · 点底部按钮开始/停止记录");
+                        }
+                    }
+                });
+            }
+            return;
+        }
         if (type == 0x01 && pl.length >= 6) {
             spo2 = pl[0] == 0 ? null : Integer.valueOf(pl[0]);
             pr = pl[1] == 0 ? null : Integer.valueOf(pl[1]);
@@ -794,7 +869,8 @@ public class MainActivity extends Activity {
             roll = pl[4] - 90;
             stateVal = pl[5];
             frameCount++;
-            writeCsv();
+            noteFallState(stateVal);
+            if (recording) writeRecord();
             ui.post(new Runnable() {
                 @Override
                 public void run() {
@@ -811,6 +887,8 @@ public class MainActivity extends Activity {
             }
         } else if (type == 0x02) {
             stateVal = 4;
+            lastFallState = 4;
+            noteFallEvent("跌倒事件包");
             ui.post(new Runnable() {
                 @Override
                 public void run() {
@@ -833,6 +911,11 @@ public class MainActivity extends Activity {
         if (s == 2) return "信号弱";
         if (s == 4) return "跌倒报警";
         return "状态 " + s;
+    }
+
+    private int prColor(Integer value, int lo, int hi) {
+        if (value == null) return DIM;
+        return (value.intValue() < lo || value.intValue() > hi) ? RED : GREEN;
     }
 
     // ================= UI 刷新 =================
@@ -874,6 +957,7 @@ public class MainActivity extends Activity {
 
         tvSpo2.setText(s2 == null ? "--" : String.valueOf(s2.intValue()));
         tvPr.setText(p2 == null ? "--" : String.valueOf(p2.intValue()));
+        tvPr.setTextColor(prColor(p2 == null ? null : p2.intValue(), hrMin, hrMax));
         tvPi.setText(pi2 <= 0 ? "--" : String.format(Locale.US, "%.1f", pi2));
 
         tvState.setText(stateName(st2));
@@ -950,32 +1034,21 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ================= CSV 记录 =================
+    // ================= 数据记录 =================
 
     private void toggleRecord() {
         if (recording) {
             stopRecord(true);
             return;
         }
-        try {
-            File dir = getExternalFilesDir(null);
-            if (dir == null) dir = getFilesDir();
-            if (!dir.exists()) dir.mkdirs();
-            String name = "ppg_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
-                    .format(new Date()) + ".csv";
-            File f = new File(dir, name);
-            csvWriter = new FileWriter(f, true);
-            csvWriter.write("timestamp_ms,spo2,pr,pi,pitch,roll,state\n");
-            csvWriter.flush();
-            csvPath = f.getAbsolutePath();
-            recording = true;
+        recording = true;
+        if (btnRecord != null) {
             btnRecord.setText("停止记录");
             btnRecord.setTextColor(RED);
             btnRecord.setBackground(roundOutline(RED));
-            Toast.makeText(this, "记录中：" + csvPath, Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            Toast.makeText(this, "无法创建文件：" + e.getMessage(), Toast.LENGTH_LONG).show();
         }
+        Toast.makeText(this, "记录中：每 1 秒保存一条，点顶部「记录」查看",
+                Toast.LENGTH_LONG).show();
     }
 
     private GradientDrawable roundOutline(int color) {
@@ -987,35 +1060,377 @@ public class MainActivity extends Activity {
     }
 
     private void stopRecord(boolean toast) {
+        boolean wasRecording = recording;
         recording = false;
-        if (csvWriter != null) {
-            try {
-                csvWriter.flush();
-                csvWriter.close();
-            } catch (Exception ignored) {
-            }
-            csvWriter = null;
-        }
         if (btnRecord != null) {
             btnRecord.setText("开始记录");
             btnRecord.setTextColor(CYAN);
             btnRecord.setBackground(roundOutline(CYAN));
         }
-        if (toast && csvPath.length() > 0) {
-            Toast.makeText(this, "已保存：\n" + csvPath, Toast.LENGTH_LONG).show();
+        if (toast && wasRecording) {
+            Toast.makeText(this, "记录已停止，点顶部「记录」查看", Toast.LENGTH_SHORT).show();
         }
     }
 
-    private void writeCsv() {
-        if (!recording || csvWriter == null) return;
+    private void writeRecord() {
+        if (recordDb == null) return;
         try {
-            csvWriter.write(System.currentTimeMillis() + ","
-                    + (spo2 == null ? "" : spo2) + ","
-                    + (pr == null ? "" : pr) + ","
-                    + String.format(Locale.US, "%.1f", pi) + ","
-                    + pitch + "," + roll + "," + stateVal + "\n");
-            csvWriter.flush();
+            recordDb.insertData(System.currentTimeMillis(), spo2, pr, pi,
+                    pitch, roll, stateVal, hrMin, hrMax);
         } catch (Exception ignored) {
+        }
+    }
+
+    private void noteFallState(int st) {
+        if (st == 4 && lastFallState != 4) {
+            noteFallEvent("跌倒报警");
+        }
+        lastFallState = st;
+    }
+
+    private void noteFallEvent(String note) {
+        long now = System.currentTimeMillis();
+        if (now - lastFallEventAt < 5000L) return;
+        lastFallEventAt = now;
+        if (recordDb != null) {
+            try {
+                recordDb.insertFall(now, spo2, pr, pi, pitch, roll, stateVal,
+                        hrMin, hrMax, note);
+            } catch (Exception ignored) {
+            }
+        }
+        ui.post(new Runnable() {
+            @Override
+            public void run() {
+                Toast.makeText(MainActivity.this, "已记录跌倒事件", Toast.LENGTH_SHORT).show();
+                if (recordPage != null) refreshRecords();
+            }
+        });
+    }
+
+    private void showRecordPage() {
+        if (recordPage != null) {
+            refreshRecords();
+            return;
+        }
+
+        LinearLayout page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setBackgroundColor(BG);
+        page.setPadding(dp(16), dp(14), dp(16), dp(14));
+        page.setClickable(true);
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+
+        Button back = makeBtn("← 返回", DIM, false);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        back.setMinWidth(0);
+        back.setMinimumWidth(0);
+        back.setPadding(dp(8), dp(6), dp(8), dp(6));
+        back.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                closeRecordPage();
+            }
+        });
+        bar.addView(back);
+
+        TextView title = makeLabel("数据记录", 20, TEXT);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        titleLp.setMargins(dp(10), 0, dp(8), 0);
+        bar.addView(title, titleLp);
+
+        Button refresh = makeBtn("刷新", CYAN, false);
+        refresh.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        refresh.setMinWidth(0);
+        refresh.setMinimumWidth(0);
+        refresh.setPadding(dp(8), dp(6), dp(8), dp(6));
+        refresh.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                refreshRecords();
+            }
+        });
+        bar.addView(refresh);
+
+        Button clear = makeBtn("清空", RED, false);
+        clear.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        clear.setMinWidth(0);
+        clear.setMinimumWidth(0);
+        clear.setPadding(dp(8), dp(6), dp(8), dp(6));
+        LinearLayout.LayoutParams clearLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        clearLp.setMargins(dp(8), 0, 0, 0);
+        clear.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                confirmClearRecords();
+            }
+        });
+        bar.addView(clear, clearLp);
+        page.addView(bar);
+
+        recordSummary = makeLabel("", 13, TEXT);
+        recordSummary.setTypeface(Typeface.DEFAULT_BOLD);
+        LinearLayout.LayoutParams summaryLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        summaryLp.setMargins(0, dp(12), 0, 0);
+        page.addView(recordSummary, summaryLp);
+
+        recordRange = makeLabel("", 11, DIM);
+        LinearLayout.LayoutParams rangeLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        rangeLp.setMargins(0, dp(4), 0, dp(8));
+        page.addView(recordRange, rangeLp);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        recordList = new LinearLayout(this);
+        recordList.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(recordList, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT,
+                ScrollView.LayoutParams.WRAP_CONTENT));
+        page.addView(scroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        int index = rootFrame.indexOfChild(alarmOverlay);
+        if (index < 0) index = rootFrame.getChildCount();
+        rootFrame.addView(page, index, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        recordPage = page;
+        refreshRecords();
+    }
+
+    private void closeRecordPage() {
+        if (recordPage == null) return;
+        rootFrame.removeView(recordPage);
+        recordPage = null;
+        recordList = null;
+        recordSummary = null;
+        recordRange = null;
+    }
+
+    private void confirmClearRecords() {
+        new AlertDialog.Builder(this)
+                .setTitle("清空数据记录")
+                .setMessage("将删除本机保存的全部血氧、脉率和跌倒记录，且无法恢复。")
+                .setPositiveButton("清空", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface d, int w) {
+                        if (recordDb != null) recordDb.clear();
+                        refreshRecords();
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void refreshRecords() {
+        if (recordList == null || recordDb == null) return;
+
+        recordRange.setText("PR 正常区间 " + hrMin + "–" + hrMax + " bpm"
+                + " · 点底部按钮开始/停止记录");
+        int total = recordDb.count();
+        int falls = recordDb.fallCount();
+        recordSummary.setText("共 " + total + " 条 · 跌倒 " + falls + " 次");
+
+        recordList.removeAllViews();
+        Cursor c = recordDb.latest(300);
+        if (c == null) return;
+        if (!c.moveToFirst()) {
+            TextView empty = makeLabel("还没有记录。\n连接后点底部「开始记录」，"
+                    + "每 1 秒保存一条；跌倒事件会自动记录。", 13, DIM);
+            empty.setGravity(Gravity.CENTER);
+            empty.setPadding(dp(12), dp(36), dp(12), dp(36));
+            recordList.addView(empty);
+            c.close();
+            return;
+        }
+
+        SimpleDateFormat fmt = new SimpleDateFormat("MM-dd HH:mm:ss", Locale.US);
+        do {
+            addRecordRow(c, fmt);
+        } while (c.moveToNext());
+        c.close();
+
+        if (total > 300) {
+            TextView more = makeLabel("仅显示最近 300 条，共 " + total + " 条", 11, DIM);
+            more.setGravity(Gravity.CENTER);
+            more.setPadding(0, dp(8), 0, dp(8));
+            recordList.addView(more);
+        }
+    }
+
+    private void addRecordRow(Cursor c, SimpleDateFormat fmt) {
+        int kind = c.getInt(c.getColumnIndexOrThrow("kind"));
+        long ts = c.getLong(c.getColumnIndexOrThrow("ts"));
+        int spo2Index = c.getColumnIndexOrThrow("spo2");
+        int prIndex = c.getColumnIndexOrThrow("pr");
+        int spo2v = c.isNull(spo2Index) ? -1 : c.getInt(spo2Index);
+        int prv = c.isNull(prIndex) ? -1 : c.getInt(prIndex);
+        double piv = c.getDouble(c.getColumnIndexOrThrow("pi"));
+        int pitchv = c.getInt(c.getColumnIndexOrThrow("pitch"));
+        int rollv = c.getInt(c.getColumnIndexOrThrow("roll"));
+        int statev = c.getInt(c.getColumnIndexOrThrow("state"));
+        int lov = c.getInt(c.getColumnIndexOrThrow("hr_min"));
+        int hiv = c.getInt(c.getColumnIndexOrThrow("hr_max"));
+        String note = c.getString(c.getColumnIndexOrThrow("note"));
+
+        boolean fall = kind == 1 || statev == 4;
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(round(fall ? 0xFF2A0F14 : SURFACE,
+                fall ? RED : STROKE, 14));
+        card.setPadding(dp(12), dp(10), dp(12), dp(10));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        TextView time = makeLabel(fmt.format(new Date(ts)), 11, DIM);
+        top.addView(time, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView badge = makePill(fall ? "跌倒" : "数据", fall ? RED : CYAN);
+        badge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        badge.setPadding(dp(8), dp(3), dp(8), dp(3));
+        top.addView(badge);
+        card.addView(top);
+
+        Integer prObj = prv < 0 ? null : Integer.valueOf(prv);
+        String prText = prObj == null ? "--" : String.valueOf(prv);
+        SpannableStringBuilder metrics = new SpannableStringBuilder();
+        metrics.append("SpO₂ ").append(spo2v < 0 ? "--" : String.valueOf(spo2v))
+                .append(" %    PR ");
+        int prStart = metrics.length();
+        metrics.append(prText);
+        metrics.setSpan(new ForegroundColorSpan(prColor(prObj, lov, hiv)),
+                prStart, metrics.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        metrics.append(" bpm    PI ")
+                .append(piv <= 0 ? "--" : String.format(Locale.US, "%.1f", piv))
+                .append(" %");
+        TextView metricsView = makeLabel("", 13, TEXT);
+        metricsView.setText(metrics);
+        LinearLayout.LayoutParams metricsLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        metricsLp.setMargins(0, dp(8), 0, 0);
+        card.addView(metricsView, metricsLp);
+
+        String stateText = stateName(statev) + " · 姿态 " + pitchv + "° / " + rollv + "°";
+        if (note != null && note.length() > 0 && !note.equals("跌倒报警")) {
+            stateText += " · " + note;
+        }
+        TextView state = makeLabel(stateText, 11, fall ? RED : DIM);
+        LinearLayout.LayoutParams stateLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        stateLp.setMargins(0, dp(5), 0, 0);
+        card.addView(state, stateLp);
+
+        LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        cardLp.setMargins(0, 0, 0, dp(8));
+        recordList.addView(card, cardLp);
+    }
+
+    // ================= 本机记录数据库 =================
+
+    private static class RecordDb extends SQLiteOpenHelper {
+        private static final String DB_NAME = "ppg_records.db";
+        private int trimCounter = 0;
+
+        RecordDb(Context c) {
+            super(c, DB_NAME, null, 1);
+        }
+
+        @Override
+        public void onCreate(SQLiteDatabase db) {
+            db.execSQL("CREATE TABLE records ("
+                    + "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    + "ts INTEGER NOT NULL,"
+                    + "kind INTEGER NOT NULL,"
+                    + "spo2 INTEGER,"
+                    + "pr INTEGER,"
+                    + "pi REAL,"
+                    + "pitch INTEGER,"
+                    + "roll INTEGER,"
+                    + "state INTEGER,"
+                    + "hr_min INTEGER,"
+                    + "hr_max INTEGER,"
+                    + "note TEXT)");
+        }
+
+        @Override
+        public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+        }
+
+        synchronized void insertData(long ts, Integer spo2, Integer pr, double pi,
+                                     int pitch, int roll, int state, int lo, int hi) {
+            insert(ts, 0, spo2, pr, pi, pitch, roll, state, lo, hi, null);
+        }
+
+        synchronized void insertFall(long ts, Integer spo2, Integer pr, double pi,
+                                     int pitch, int roll, int state, int lo, int hi,
+                                     String note) {
+            insert(ts, 1, spo2, pr, pi, pitch, roll, 4, lo, hi, note);
+        }
+
+        private void insert(long ts, int kind, Integer spo2, Integer pr, double pi,
+                            int pitch, int roll, int state, int lo, int hi, String note) {
+            SQLiteDatabase db = getWritableDatabase();
+            ContentValues v = new ContentValues();
+            v.put("ts", ts);
+            v.put("kind", kind);
+            if (spo2 == null) v.putNull("spo2"); else v.put("spo2", spo2.intValue());
+            if (pr == null) v.putNull("pr"); else v.put("pr", pr.intValue());
+            v.put("pi", pi);
+            v.put("pitch", pitch);
+            v.put("roll", roll);
+            v.put("state", state);
+            v.put("hr_min", lo);
+            v.put("hr_max", hi);
+            if (note == null) v.putNull("note"); else v.put("note", note);
+            db.insert("records", null, v);
+            if (++trimCounter >= 100) {
+                trimCounter = 0;
+                db.execSQL("DELETE FROM records WHERE id NOT IN "
+                        + "(SELECT id FROM records ORDER BY id DESC LIMIT " + RECORD_LIMIT + ")");
+            }
+        }
+
+        synchronized int count() {
+            Cursor c = getReadableDatabase().rawQuery("SELECT COUNT(*) FROM records", null);
+            int n = 0;
+            if (c.moveToFirst()) n = c.getInt(0);
+            c.close();
+            return n;
+        }
+
+        synchronized int fallCount() {
+            Cursor c = getReadableDatabase().rawQuery(
+                    "SELECT COUNT(*) FROM records WHERE kind=1", null);
+            int n = 0;
+            if (c.moveToFirst()) n = c.getInt(0);
+            c.close();
+            return n;
+        }
+
+        synchronized Cursor latest(int limit) {
+            return getReadableDatabase().query("records", null, null, null,
+                    null, null, "id DESC", String.valueOf(limit));
+        }
+
+        synchronized void clear() {
+            getWritableDatabase().delete("records", null, null);
         }
     }
 
