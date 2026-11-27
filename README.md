@@ -16,6 +16,10 @@
 
 ## 硬件
 
+![v6 转接板整机实物](docs/实物图_v6_20261127.jpg)
+
+图中为 v6 转接板装配后的整机实物：SH1106 OLED、STM32F103C8T6、MAX30102、MPU6050、四按键、蜂鸣器和 Type-C 供电。
+
 | 部件 | 型号 | 接口 |
 |---|---|---|
 | MCU | STM32F103C8T6（Blue Pill，72 MHz） | — |
@@ -90,7 +94,7 @@ KEY1-4 PB1 / PA6 / PA8 / PB15
 04_验收数据/          采集 CSV、原始 400 点窗、可复跑采集脚本
 05_设计资料/          v6 PCB 工程、Gerber、BOM、原理图/PCB 图、交接文档
 06_Android手机端App/  MainActivity.java、v3 APK、使用说明
-docs/                 README 用的系统框图
+docs/                 README 用的系统框图与实物图
 ```
 
 算法怎么一步步改过来的，看 `01_报告/课设报告_MAX30102脉率判据五轮演进_定稿_20261116.md`。
